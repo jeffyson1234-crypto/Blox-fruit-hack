@@ -1,8 +1,7 @@
 --[[=====================================================================
-  VENICE HUB v4  ·  BLOX FRUITS  ·  Xeno / UNC / Solara / Delta
+  VENICE HUB v5  ·  BLOX FRUITS  ·  Xeno / UNC / Solara / Delta
   RightControl = toggle UI   |   RightShift = unload
-  Tween-based movement (anti-cheat safe). Hits carry a validated hitId.
-  Requires level 1+. Sea detection is automatic.
+  Tween movement, hitId-validated hits, close-range glue so melee connects.
 =====================================================================]]
 
 local Players     = game:GetService("Players")
@@ -20,7 +19,6 @@ local TeleportSvc = game:GetService("TeleportService")
 local LP = Players.LocalPlayer
 if not LP then return end
 
--- clean previous instance
 if getgenv and getgenv().VeniceHub and getgenv().VeniceHub.Gui then
     pcall(function() getgenv().VeniceHub.Gui:Destroy() end)
 end
@@ -39,9 +37,10 @@ local function notify(text, title)
 end
 
 --=====================================================================
---  NET  ·  RegisterAttack / RegisterHit + hitId capture
+--  NET
 --=====================================================================
-local Net = (getgenv and getgenv().VeniceHubNet) or { hitId = nil, hooked = false, combo = 0, fallbackTried = false }
+local Net = (getgenv and getgenv().VeniceHubNet) or
+    { hitId = nil, hooked = false, combo = 0, fallbackTried = false }
 if getgenv then getgenv().VeniceHubNet = Net end
 
 local RA_cache, RH_cache
@@ -62,7 +61,7 @@ local function installHitCapture()
     local _, RegisterHit = netModules()
     if not RegisterHit then return false end
     if not (hookmetamethod and getnamecallmethod and checkcaller and newcclosure) then
-        log("hitId capture unavailable (missing hook API)")
+        log("hitId capture unavailable")
         return false
     end
     local old
@@ -82,7 +81,6 @@ local function installHitCapture()
     return true
 end
 
--- fallback id if the hook never sees a real one (fresh account / no manual M1 yet)
 local function ensureHitId()
     if Net.hitId then return Net.hitId end
     if Net.fallbackTried then return nil end
@@ -92,7 +90,7 @@ local function ensureHitId()
     local id = tostring(LP.UserId):sub(2, 4) .. tostring(math.floor(os.clock() * 100000))
     pcall(function() RegisterHit:FireServer(id) end)
     Net.hitId = id
-    log("hitId fallback generated: " .. id)
+    log("hitId fallback generated")
     return id
 end
 
@@ -110,7 +108,6 @@ local function invoke(...)
     return ok and res or nil
 end
 
--- retry hook installation until Modules.Net exists
 task.spawn(function()
     for _ = 1, 40 do
         if Net.hooked or installHitCapture() then break end
@@ -122,17 +119,21 @@ end)
 --  CONFIG
 --=====================================================================
 local CONFIG_DIR  = "VeniceHub"
-local CONFIG_FILE = CONFIG_DIR .. "/bloxfruits.json"
+local CONFIG_FILE = CONFIG_DIR .. "/bloxfruits_v5.json"
 local WP_FILE     = CONFIG_DIR .. "/waypoints.json"
 
-local S = {
-    FlySpeed = 200, HeightOffset = 12, HoverRange = 250, AttackInterval = 0.2,
+local DEFAULTS = {
+    FlySpeed = 220,
+    HeightOffset = 5,        -- studs above the mob. small = melee connects
+    EngageRange = 50,        -- fly when farther than this
+    BringRange = 250,        -- magnet radius
+    AttackInterval = 0.2,
     AutoFarm = false, FarmNearest = false, BossFarm = false,
-    BringMob = false, AutoEquip = false, EquipType = "Melee",
-    QuestIndex = 0, BossIndex = 1, MaterialIndex = 1, MaterialFarm = false,
+    BringMob = true, BigHitbox = true, AutoEquip = true, EquipType = "Melee",
+    QuestIndex = 0, BossIndex = 1, MaterialIndex = 1, MaterialFarm = false, AutoSaber = false,
     AutoPoints = false, Stat = "Melee", StatAmount = 1,
     AutoChest = false, AutoLoot = false, AutoFruit = false,
-    CollectSpeed = 350, LootRange = 600,
+    CollectSpeed = 400, LootRange = 600,
     FastAttack = false, KillAura = false, AuraRange = 60, LOS = true,
     AttackPlayers = false, PlayerRange = 60,
     Aimbot = false, AimSmooth = 15, Follow = false, Duel1v1 = false, Spectate = false,
@@ -141,10 +142,13 @@ local S = {
     AutoBounty = false, BountyTeam = "Both", BountyMethod = "Nearest",
     NoFriends = true, NoCup = true, NoStun = false, SafeHP = 20,
     Speed = 16, Jump = 50, InfEnergy = false, Noclip = false, Fly = false,
-    AutoBuso = false, AutoKen = false, AntiAFK = true, Fullbright = false,
+    AutoBuso = true, AutoKen = false, AntiAFK = true, Fullbright = false,
     ESPMobs = false, ESPPlayers = false, ESPChests = false, ESPFruits = false,
     IslandIndex = 1, BossTPIndex = 1,
 }
+
+local S = {}
+for k, v in pairs(DEFAULTS) do S[k] = v end
 
 local function saveConfig()
     if not writefile then return end
@@ -161,6 +165,10 @@ local function loadConfig()
             if S[k] ~= nil and type(S[k]) == type(v) then S[k] = v end
         end
     end)
+end
+local function resetConfig()
+    for k, v in pairs(DEFAULTS) do S[k] = v end
+    saveConfig()
 end
 loadConfig()
 
@@ -188,9 +196,13 @@ local function sea()
     if id == 7449423635 then return 3 end
     return 1
 end
+local function isNetworkOwner(part)
+    local ok, res = pcall(function() return part:IsNetworkOwner() end)
+    return ok and res or false
+end
 
 --=====================================================================
---  TELEPORT  ·  tween-based, never anchors
+--  TELEPORT
 --=====================================================================
 local activeTween
 local function tpCancel()
@@ -201,6 +213,7 @@ local function tpGo(pos, speed)
     local h = hrp()
     if not h then return end
     local dist = (h.Position - pos).Magnitude
+    if dist < 0.5 then return end
     local t = math.clamp(dist / math.max(speed or S.FlySpeed, 1), 0.05, 90)
     tpCancel()
     local tw = Tween:Create(h, TweenInfo.new(t, Enum.EasingStyle.Linear), { CFrame = CFrame.new(pos) })
@@ -445,6 +458,13 @@ local SPAWNS = {
     ["Sea Chanter"]=Vector3.new(10680.1,-2056.7,9933.9), ["Ocean Prophet"]=Vector3.new(11129.8,-2007.8,10051.5),
     ["Grand Devotee"]=Vector3.new(9559.2,-1994.4,9798.7),
 }
+local KILLS = {
+    Bandit=5, Monkey=6, Gorilla=8, Pirate=8, Brute=8, ["Desert Bandit"]=8, ["Desert Officer"]=6,
+    ["Snow Bandit"]=7, Snowman=8, ["Chief Petty Officer"]=8, ["Vice Admiral"]=1, ["Sky Bandit"]=7,
+    ["Dark Master"]=8, Prisoner=8, ["Dangerous Prisoner"]=8, ["Toga Warrior"]=7, Gladiator=8,
+    ["Military Soldier"]=7, ["Military Spy"]=8, ["Fishman Warrior"]=8, ["Fishman Commando"]=7,
+    Shanda=9, ["Royal Squad"]=8, ["Royal Soldier"]=8, ["Galley Pirate"]=8, ["Galley Captain"]=9,
+}
 local MATERIALS = {
     [2] = { { "Scrap Metal","Factory Staff" }, { "Vampire Fang","Vampire" },
             { "Magma Ore","Magma Ninja" }, { "Conjured Cocoa","Ship Deckhand" },
@@ -460,8 +480,9 @@ local MATERIALS = {
 local function mobsNamed(name)
     local out, f = {}, enemies()
     if not f then return out end
+    local lower = name:lower()
     for _, e in ipairs(f:GetChildren()) do
-        if e.Name:lower() == name:lower() then
+        if e.Name:lower() == lower then
             local h = e:FindFirstChildOfClass("Humanoid")
             if h and h.Health > 0 then out[#out + 1] = e end
         end
@@ -472,9 +493,10 @@ end
 local function nearestMob(name)
     local h, f = hrp(), enemies()
     if not h or not f then return nil end
+    local lower = name:lower()
     local best, bd
     for _, e in ipairs(f:GetChildren()) do
-        if e.Name:lower() == name:lower() then
+        if e.Name:lower() == lower then
             local hu = e:FindFirstChildOfClass("Humanoid")
             local p = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
             if hu and hu.Health > 0 and p then
@@ -583,7 +605,6 @@ local function isRod(t)
     local tip = t.ToolTip
     return (tip and (tostring(tip):find("Fishing") or tostring(tip):find("Rod"))) or t.Name:find("Rod") ~= nil
 end
-local function isChip(t) return t.Name:find("Microchip") ~= nil end
 
 local function ensureNotRod()
     local c = LP.Character
@@ -608,11 +629,11 @@ local function equipKind(kind)
         return t.ToolTip == kind
     end
     local eq = c:FindFirstChildOfClass("Tool")
-    if eq and match(eq) then return end
+    if eq and match(eq) and not isRod(eq) then return end
     for _, pool in ipairs({ c, LP:FindFirstChild("Backpack") }) do
         if pool then
             for _, t in ipairs(pool:GetChildren()) do
-                if t:IsA("Tool") and match(t) then
+                if t:IsA("Tool") and match(t) and not isRod(t) then
                     pcall(function() h:EquipTool(t) end)
                     return
                 end
@@ -706,10 +727,11 @@ local function pressKey(name)
 end
 
 --=====================================================================
---  FARM
+--  FARM STATE
 --=====================================================================
-local curKey, target, anchor, killCount, killReq, prevAlive, bestQ
+local curKey, target, anchor, killCount, prevAlive, bestQ
 local farmGen = 0
+local decollided = setmetatable({}, { __mode = "k" })
 
 local function questList() return QUESTS[sea()] or QUESTS[1] end
 
@@ -733,70 +755,72 @@ local function startQuest()
     if q then invoke("StartQuest", q.id, q.tier) end
 end
 
-local function farmStep()
+local function resetFarmState()
+    curKey, target, anchor, killCount, prevAlive, bestQ = nil, nil, nil, 0, nil, nil
+    decollided = setmetatable({}, { __mode = "k" })
+end
+
+-- slow loop: choose target, handle movement + quest bookkeeping
+local function farmMove()
     local q = currentQuest()
     if not q then return end
     bestQ = q
 
-    local list = mobsNamed(q.mob)
+    -- kill counting for quest completion
+    local alive = mobsNamed(q.mob)
     local curr = {}
-    for _, e in ipairs(list) do curr[e] = true end
+    for _, e in ipairs(alive) do curr[e] = true end
     if prevAlive then
         for e in pairs(prevAlive) do if not curr[e] then killCount = killCount + 1 end end
     end
     prevAlive = curr
 
     local key = q.id .. "#" .. q.tier
+    local need = KILLS[q.mob] or 8
     if key ~= curKey then
-        curKey, target, anchor, killCount, prevAlive = key, nil, nil, 0, nil
+        curKey, killCount = key, 0
         startQuest()
-    elseif killCount >= (killReq or 8) then
+    elseif killCount >= need then
         killCount = 0
         startQuest()
     end
 
     local t = nearestMob(q.mob)
-    if t then
-        target = t
-        local p = t:FindFirstChild("HumanoidRootPart") or t.PrimaryPart
-        local h = hrp()
-        if S.BringMob then
-            if not anchor and p and h then
-                if (p.Position - h.Position).Magnitude > S.HoverRange then
-                    tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
-                else
-                    anchor = p.Position
-                    tpCancel()
-                end
-            end
-        elseif p and h and (p.Position - h.Position).Magnitude > S.HoverRange then
-            tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
-        end
-        if S.AutoEquip then equipKind(S.EquipType) end
-        if S.BringMob then
-            for _, e in ipairs(list) do attackOnce(e) end
-        else
-            attackOnce(t)
-        end
-        if S.AttackPlayers then
-            for _, c in ipairs(playersInRange(S.PlayerRange)) do attackOnce(c) end
-        end
-        task.wait(effDelay())
-    elseif S.BringMob and anchor then
-        task.wait(1)
-    else
+    if not t then
+        target, anchor = nil, nil
         local sp, h = SPAWNS[q.mob], hrp()
-        if sp and h then
-            local d = (h.Position - sp).Magnitude
-            if d > 150 then
-                tpGo(sp + Vector3.new(0, S.HeightOffset, 0))
-                task.wait(math.clamp(d / math.max(S.FlySpeed, 1), 0.3, 90) + 0.4)
-            else
-                task.wait(1.2)
-            end
-        else
-            task.wait(0.4)
+        if sp and h and (h.Position - sp).Magnitude > 120 then
+            tpGo(sp + Vector3.new(0, S.HeightOffset, 0))
         end
+        return
+    end
+
+    target = t
+    local p = t:FindFirstChild("HumanoidRootPart") or t.PrimaryPart
+    local h = hrp()
+    if not (p and h) then return end
+    local dist = (p.Position - h.Position).Magnitude
+
+    if S.BringMob then
+        -- drop the anchor if nothing of this mob type is near it anymore
+        if anchor then
+            local near = false
+            for _, e in ipairs(alive) do
+                local ep = e:FindFirstChild("HumanoidRootPart")
+                if ep and (ep.Position - anchor).Magnitude < S.BringRange then near = true break end
+            end
+            if not near then anchor = nil end
+        end
+        if not anchor then
+            if dist > S.EngageRange then
+                tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
+            else
+                anchor = h.Position
+                tpCancel()
+            end
+        end
+    elseif dist > S.EngageRange then
+        tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
     end
 end
 
@@ -805,43 +829,54 @@ local function runFarm()
     task.spawn(function()
         installHitCapture()
         while S.AutoFarm and farmGen == gen do
-            local ok, err = pcall(farmStep)
-            if not ok then log("farm step: " .. tostring(err)) task.wait(0.3) end
+            local ok, err = pcall(farmMove)
+            if not ok then log("farm: " .. tostring(err)) end
+            task.wait(0.12)
         end
     end)
 end
 
+-- render loop: glue to target / pin mobs
 RunService.RenderStepped:Connect(function()
     if not (S.AutoFarm or S.BossFarm or S.FarmNearest) then return end
     local h = hrp()
     if not h then return end
     if h.Anchored then h.Anchored = false end
-    h.AssemblyLinearVelocity = Vector3.zero
 
     if S.BringMob and anchor and bestQ then
-        h.CFrame = CFrame.new(anchor + Vector3.new(0, S.HeightOffset, 0))
+        h.CFrame = CFrame.new(anchor)
         h.AssemblyLinearVelocity = Vector3.zero
         local f = enemies()
-        if f then
-            for _, e in ipairs(f:GetChildren()) do
-                if e.Name:lower() == bestQ.mob:lower() then
-                    local hu = e:FindFirstChildOfClass("Humanoid")
-                    local ep = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
-                    if hu and hu.Health > 0 and ep then
+        if not f then return end
+        local lower = bestQ.mob:lower()
+        local pin = anchor + Vector3.new(0, -3, 0)
+        for _, e in ipairs(f:GetChildren()) do
+            if e.Name:lower() == lower then
+                local hu = e:FindFirstChildOfClass("Humanoid")
+                local ep = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
+                if hu and hu.Health > 0 and ep and (ep.Position - anchor).Magnitude < S.BringRange then
+                    if not decollided[e] then
                         for _, bp in ipairs(e:GetDescendants()) do
-                            if bp:IsA("BasePart") and bp.CanCollide then bp.CanCollide = false end
+                            if bp:IsA("BasePart") then bp.CanCollide = false end
                         end
-                        ep.CFrame = CFrame.new(anchor)
-                        ep.AssemblyLinearVelocity = Vector3.zero
+                        decollided[e] = true
                     end
+                    if S.BigHitbox and ep.Size ~= Vector3.new(50, 50, 50) then
+                        ep.Size = Vector3.new(50, 50, 50)
+                    end
+                    ep.CFrame = CFrame.new(pin)
+                    ep.AssemblyLinearVelocity = Vector3.zero
                 end
             end
         end
-    elseif target and target.Parent then
+    elseif target and target.Parent and not S.BringMob then
         local p = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
-        if p and (p.Position - h.Position).Magnitude < S.HoverRange then
-            h.CFrame = CFrame.new(p.Position + Vector3.new(0, S.HeightOffset, 0))
-            h.AssemblyLinearVelocity = Vector3.zero
+        if p then
+            local d = (p.Position - h.Position).Magnitude
+            if d < S.EngageRange * 2 then
+                h.CFrame = CFrame.new(p.Position + Vector3.new(0, S.HeightOffset, 0))
+                h.AssemblyLinearVelocity = Vector3.zero
+            end
         end
     end
 end)
@@ -849,7 +884,30 @@ end)
 --=====================================================================
 --  LOOPS
 --=====================================================================
-local function othersFarming() return S.AutoFarm or S.BossFarm or S.FarmNearest end
+local function farming() return S.AutoFarm or S.BossFarm or S.FarmNearest end
+
+task.spawn(function()  -- attack driver (independent of movement)
+    local equipTick = 0
+    while true do
+        if farming() and LP.Character then
+            equipTick = equipTick + 1
+            if S.AutoEquip and equipTick % 8 == 1 then equipKind(S.EquipType) end
+            if S.BringMob and bestQ then
+                local list = mobsNamed(bestQ.mob)
+                local n = math.min(#list, 15)
+                for i = 1, n do attackOnce(list[i]) end
+            elseif target and target.Parent then
+                attackOnce(target)
+            end
+            if S.AttackPlayers then
+                for _, c in ipairs(playersInRange(S.PlayerRange)) do attackOnce(c) end
+            end
+            task.wait(effDelay())
+        else
+            task.wait(0.1)
+        end
+    end
+end)
 
 task.spawn(function()  -- farm nearest
     while true do
@@ -859,16 +917,13 @@ task.spawn(function()  -- farm nearest
                 target = t
                 local p = t:FindFirstChild("HumanoidRootPart") or t.PrimaryPart
                 local h = hrp()
-                if p and h and (p.Position - h.Position).Magnitude > S.HoverRange then
+                if p and h and (p.Position - h.Position).Magnitude > S.EngageRange then
                     tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
                 end
-                if S.AutoEquip then equipKind(S.EquipType) end
-                attackOnce(t)
-                if S.AttackPlayers then
-                    for _, c in ipairs(playersInRange(S.PlayerRange)) do attackOnce(c) end
-                end
+            else
+                target = nil
             end
-            task.wait(effDelay())
+            task.wait(0.15)
         else
             task.wait(0.3)
         end
@@ -886,17 +941,16 @@ task.spawn(function()  -- boss farm
                     target = t
                     local p = t:FindFirstChild("HumanoidRootPart") or t.PrimaryPart
                     local h = hrp()
-                    if p and h and (p.Position - h.Position).Magnitude > S.HoverRange then
+                    if p and h and (p.Position - h.Position).Magnitude > S.EngageRange then
                         tpGo(p.Position + Vector3.new(0, S.HeightOffset, 0))
                     end
-                    if S.AutoEquip then equipKind(S.EquipType) end
-                    attackOnce(t)
                 else
+                    target = nil
                     tpGo(b[3] + Vector3.new(0, S.HeightOffset, 0))
                     task.wait(2)
                 end
             end
-            task.wait(effDelay())
+            task.wait(0.15)
         else
             task.wait(0.3)
         end
@@ -933,9 +987,9 @@ task.spawn(function()  -- auto skills
         if S.AutoSkills and LP.Character then
             local order = { { "Z", S.KeyZ }, { "X", S.KeyX }, { "C", S.KeyC },
                             { "V", S.KeyV }, { "F", S.KeyF } }
-            for _, e in ipairs(order) do
+            for i = 1, #order do
                 if not S.AutoSkills then break end
-                if e[2] then pressKey(e[1]) end
+                if order[i][2] then pressKey(order[i][1]) end
             end
         end
         task.wait(S.SkillInterval / 1000)
@@ -944,13 +998,13 @@ end)
 
 task.spawn(function()  -- chests
     while true do
-        if S.AutoChest and not othersFarming() and LP.Character then
+        if S.AutoChest and not farming() and LP.Character then
             local list = getChests()
             if #list > 0 then
                 table.sort(list, function(a, b) return a.d < b.d end)
-                for _, c in ipairs(list) do
-                    if not S.AutoChest or othersFarming() then break end
-                    tpGo(c.part.Position + Vector3.new(0, 4, 0), S.CollectSpeed)
+                for i = 1, #list do
+                    if not S.AutoChest or farming() then break end
+                    tpGo(list[i].part.Position + Vector3.new(0, 4, 0), S.CollectSpeed)
                     task.wait(0.15)
                 end
             else
@@ -964,13 +1018,13 @@ end)
 
 task.spawn(function()  -- loot
     while true do
-        if S.AutoLoot and not othersFarming() and LP.Character then
+        if S.AutoLoot and not farming() and LP.Character then
             local list = getLoot(S.LootRange)
             if #list > 0 then
                 table.sort(list, function(a, b) return a.d < b.d end)
-                for _, it in ipairs(list) do
-                    if not S.AutoLoot or othersFarming() then break end
-                    tpGo(it.part.Position + Vector3.new(0, 3, 0), S.CollectSpeed)
+                for i = 1, #list do
+                    if not S.AutoLoot or farming() then break end
+                    tpGo(list[i].part.Position + Vector3.new(0, 3, 0), S.CollectSpeed)
                     task.wait(0.12)
                 end
             else
@@ -984,7 +1038,7 @@ end)
 
 task.spawn(function()  -- fruit
     while true do
-        if S.AutoFruit and not othersFarming() and LP.Character then
+        if S.AutoFruit and not farming() and LP.Character then
             local f = getGroundFruits()
             if #f > 0 then
                 table.sort(f, function(a, b) return a.d < b.d end)
@@ -1049,7 +1103,7 @@ task.spawn(function()  -- bounty
                                     if t:IsA("Tool") and t.Name == "Cup" then skip = true end
                                 end
                             end
-                            if S.BountyTeam ~= "Both" and p.Team then
+                            if S.BountyTeam ~= "Both" and p.Team and not skip then
                                 if not p.Team.Name:lower():find(S.BountyTeam:lower()) then skip = true end
                             end
                             if not skip then
@@ -1075,7 +1129,7 @@ task.spawn(function()  -- bounty
     end
 end)
 
-task.spawn(function()  -- camera: aimbot / spectate / follow
+task.spawn(function()  -- camera
     while true do
         local cam = workspace.CurrentCamera
         if cam then
@@ -1134,7 +1188,11 @@ local function applyStats()
         h.JumpPower = S.Jump
     end
 end
-LP.CharacterAdded:Connect(function() task.wait(1.5) applyStats() end)
+LP.CharacterAdded:Connect(function()
+    task.wait(1.5)
+    resetFarmState()
+    applyStats()
+end)
 
 RunService.Stepped:Connect(function()
     if not S.Noclip then return end
@@ -1265,7 +1323,7 @@ LP.Idled:Connect(function()
 end)
 
 --=====================================================================
---  GUI LIBRARY
+--  GUI
 --=====================================================================
 local Theme = {
     BG = Color3.fromRGB(15, 15, 20), Panel = Color3.fromRGB(25, 25, 34),
@@ -1309,7 +1367,7 @@ make("Frame", { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 1, -12
     BackgroundColor3 = Theme.Panel, BorderSizePixel = 0, Parent = Bar })
 make("TextLabel", { Size = UDim2.new(1, -100, 1, 0), Position = UDim2.new(0, 14, 0, 0),
     BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Theme.Text,
-    TextXAlignment = Enum.TextXAlignment.Left, Text = "VENICE HUB v4  ·  BLOX FRUITS", Parent = Bar })
+    TextXAlignment = Enum.TextXAlignment.Left, Text = "VENICE HUB v5  ·  BLOX FRUITS", Parent = Bar })
 
 local TabHolder = make("Frame", { Size = UDim2.new(0, 128, 1, -66), Position = UDim2.new(0, 8, 0, 38),
     BackgroundTransparency = 1, Parent = Main })
@@ -1336,10 +1394,10 @@ local function newTab(name)
     end)
     tabs[#tabs + 1] = { btn = btn, page = page }
     btn.MouseButton1Click:Connect(function()
-        for _, t in ipairs(tabs) do
-            t.page.Visible = false
-            t.btn.BackgroundColor3 = Theme.Panel
-            t.btn.TextColor3 = Theme.Sub
+        for i = 1, #tabs do
+            tabs[i].page.Visible = false
+            tabs[i].btn.BackgroundColor3 = Theme.Panel
+            tabs[i].btn.TextColor3 = Theme.Sub
         end
         page.Visible = true
         btn.BackgroundColor3 = Theme.Accent
@@ -1498,7 +1556,8 @@ local function Dropdown(parent, text, options, cb)
         holder.CanvasSize = UDim2.new(0, 0, 0, n * 20 + 6)
         holder.Size = UDim2.new(1, 0, 0, listH)
         f.Size = UDim2.new(1, 0, 0, open and (29 + listH) or 27)
-        for i, opt in ipairs(opts) do
+        for i = 1, #opts do
+            local opt = opts[i]
             local ob = make("TextButton", { Size = UDim2.new(1, 0, 0, 19), BackgroundColor3 = Theme.BG,
                 Text = "  " .. tostring(opt), Font = Enum.Font.Gotham, TextSize = 11,
                 TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = holder })
@@ -1560,7 +1619,8 @@ local function saveWaypoints()
     pcall(function()
         if isfolder and not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
         local out = {}
-        for _, w in ipairs(waypoints) do
+        for i = 1, #waypoints do
+            local w = waypoints[i]
             out[#out + 1] = { name = w.name, x = w.pos.X, y = w.pos.Y, z = w.pos.Z }
         end
         writefile(WP_FILE, Http:JSONEncode(out))
@@ -1572,7 +1632,7 @@ end
 --=====================================================================
 local pFarm = newTab("Farm")
 Section(pFarm, "Auto Level Farm")
-local setFarmT, setNearestT, setBossT
+local setFarmT, setNearestT, setBossT, setSaberT
 
 local _, _, _, setQuestOptions = Dropdown(pFarm, "Quest", { "Auto (by level)" }, function(_, i)
     S.QuestIndex = i - 1
@@ -1585,8 +1645,11 @@ setFarmT = select(2, Toggle(pFarm, "Auto Level Farm (quest)", S.AutoFarm, functi
         S.BossFarm = false
         if setNearestT then setNearestT(false) end
         if setBossT then setBossT(false) end
+        resetFarmState()
         farmGen = farmGen + 1
         runFarm()
+    else
+        resetFarmState()
     end
 end))
 setNearestT = select(2, Toggle(pFarm, "Farm Nearest (any mob)", S.FarmNearest, function(v)
@@ -1596,14 +1659,20 @@ setNearestT = select(2, Toggle(pFarm, "Farm Nearest (any mob)", S.FarmNearest, f
         S.BossFarm = false
         if setFarmT then setFarmT(false) end
         if setBossT then setBossT(false) end
+        resetFarmState()
     end
 end))
-Toggle(pFarm, "Bring Mob (stack under you)", S.BringMob, function(v) S.BringMob = v end)
-Slider(pFarm, "Height Offset", 0, 40, S.HeightOffset, function(v) S.HeightOffset = v end)
-Slider(pFarm, "Hover Range", 50, 500, S.HoverRange, function(v) S.HoverRange = v end)
+Section(pFarm, "Positioning")
+Slider(pFarm, "Hover Height  (lower = melee connects)", 0, 30, S.HeightOffset, function(v) S.HeightOffset = v end)
+Slider(pFarm, "Engage Range  (fly when farther)", 10, 300, S.EngageRange, function(v) S.EngageRange = v end)
+Toggle(pFarm, "Bring Mob (magnet + pin)", S.BringMob, function(v) S.BringMob = v end)
+Slider(pFarm, "Magnet Range", 50, 800, S.BringRange, function(v) S.BringRange = v end)
+Toggle(pFarm, "Big Hitbox (50x50 mob HRP)", S.BigHitbox, function(v) S.BigHitbox = v end)
+Section(pFarm, "Weapon")
 Toggle(pFarm, "Auto Equip", S.AutoEquip, function(v) S.AutoEquip = v end)
 Dropdown(pFarm, "Equip Type", { "Melee", "Sword", "Gun", "Fruit" }, function(v) S.EquipType = v end)
 Slider(pFarm, "Attack Interval", 0.05, 1, S.AttackInterval, function(v) S.AttackInterval = v end)
+Toggle(pFarm, "Fast Attack", S.FastAttack, function(v) S.FastAttack = v end)
 
 Section(pFarm, "Boss")
 local _, _, _, setBossOptions = Dropdown(pFarm, "Boss", { "-" }, function(_, i) S.BossIndex = i end)
@@ -1614,27 +1683,32 @@ setBossT = select(2, Toggle(pFarm, "Farm Boss", S.BossFarm, function(v)
         S.FarmNearest = false
         if setFarmT then setFarmT(false) end
         if setNearestT then setNearestT(false) end
+        resetFarmState()
     end
 end))
-Toggle(pFarm, "Auto Saber (Saber Expert)", false, function(v)
-    if v then
-        for i, b in ipairs(BOSSES[1]) do
-            if b[1] == "Saber Expert" then S.BossIndex = i end
-        end
-        if setBossT then setBossT(true) end
+setSaberT = select(2, Toggle(pFarm, "Auto Saber (Saber Expert)", S.AutoSaber, function(v)
+    S.AutoSaber = v
+    if not v then return end
+    local list = BOSSES[sea()] or BOSSES[1]
+    for i = 1, #list do
+        if list[i][1] == "Saber Expert" then S.BossIndex = i break end
     end
-end)
+    if setBossT then setBossT(true) end
+end))
 
 Section(pFarm, "Materials")
 local _, _, _, setMatOptions = Dropdown(pFarm, "Material", { "-" }, function(_, i) S.MaterialIndex = i end)
 Toggle(pFarm, "Material Farm", S.MaterialFarm, function(v)
     S.MaterialFarm = v
     if not v then return end
-    local m = (MATERIALS[sea()] or {})[S.MaterialIndex]
-    if not m then notify("No material farm in this sea") return end
+    local mats = MATERIALS[sea()]
+    if not mats then notify("No materials in Sea " .. sea()) return end
+    local m = mats[math.clamp(S.MaterialIndex, 1, #mats)]
+    if not m then return end
     local found = false
-    for i, q in ipairs(questList()) do
-        if q.mob == m[2] then S.QuestIndex = i found = true break end
+    local list = questList()
+    for i = 1, #list do
+        if list[i].mob == m[2] then S.QuestIndex = i found = true break end
     end
     if found then
         curKey = nil
@@ -1659,7 +1733,6 @@ Slider(pFarm, "Collect Speed", 100, 1000, S.CollectSpeed, function(v) S.CollectS
 
 local pPvp = newTab("PVP")
 Section(pPvp, "Combat")
-Toggle(pPvp, "Fast Attack", S.FastAttack, function(v) S.FastAttack = v end)
 Toggle(pPvp, "Attack Players", S.AttackPlayers, function(v) S.AttackPlayers = v end)
 Slider(pPvp, "Player Range", 10, 300, S.PlayerRange, function(v) S.PlayerRange = v end)
 Section(pPvp, "Kill Aura")
@@ -1876,8 +1949,8 @@ Button(pMisc, "Run Diagnostics (prints + copies)", function()
         "RegisterHit: " .. tostring(RH),
         "hitId: " .. tostring(Net.hitId),
         "hookmetamethod: " .. tostring(hookmetamethod ~= nil),
-        "firetouchinterest: " .. tostring(firetouchinterest ~= nil),
         "gethui: " .. tostring(gethui ~= nil),
+        "isNetworkOwner: " .. tostring(isNetworkOwner(hrp() or workspace.Baseplate)),
     }
     local s = table.concat(l, "\n")
     print("[VeniceHub DIAG]\n" .. s)
@@ -1896,7 +1969,10 @@ Button(pMisc, "Force hitId Re-capture", function()
 end)
 Section(pMisc, "Config")
 Button(pMisc, "Save Settings", function() saveConfig() notify("Settings saved") end)
-Button(pMisc, "Load Settings", function() loadConfig() notify("Settings loaded") end)
+Button(pMisc, "Reset to Defaults", function()
+    resetConfig()
+    notify("Defaults restored (re-toggle to apply)")
+end)
 Section(pMisc, "Info")
 Button(pMisc, "Toggle UI (RightControl)", function() Main.Visible = not Main.Visible end)
 Button(pMisc, "Unload Hub (RightShift)", function()
@@ -1909,36 +1985,41 @@ Button(pMisc, "Unload Hub (RightShift)", function()
 end)
 
 --=====================================================================
---  SEA WATCHER  ·  rebuild dropdowns when the place changes
+--  SEA WATCHER
 --=====================================================================
 local function rebuildForSea(s)
     local ql = { "Auto (by level)" }
-    for _, q in ipairs(QUESTS[s] or QUESTS[1]) do
-        ql[#ql + 1] = q.mob .. " (Lv " .. q.lvl .. ")"
-    end
+    local src = QUESTS[s] or QUESTS[1]
+    for i = 1, #src do ql[#ql + 1] = src[i].mob .. " (Lv " .. src[i].lvl .. ")" end
     setQuestOptions(ql)
     S.QuestIndex = 0
-    curKey = nil
 
     local il = {}
-    for _, e in ipairs(ISLANDS[s] or ISLANDS[1]) do il[#il + 1] = e[1] end
+    local isl = ISLANDS[s] or ISLANDS[1]
+    for i = 1, #isl do il[#il + 1] = isl[i][1] end
     setIslandOptions(il)
     S.IslandIndex = 1
 
     local bl = {}
-    for _, e in ipairs(BOSSES[s] or BOSSES[1]) do bl[#bl + 1] = e[1] .. " (Lv " .. e[2] .. ")" end
+    local bs = BOSSES[s] or BOSSES[1]
+    for i = 1, #bs do bl[#bl + 1] = bs[i][1] .. " (Lv " .. bs[i][2] .. ")" end
     setBossOptions(bl)
     setBossTPOptions(bl)
     S.BossIndex = 1
     S.BossTPIndex = 1
 
     local ml = {}
-    for _, e in ipairs(MATERIALS[s] or {}) do ml[#ml + 1] = e[1] .. "  (" .. e[2] .. ")" end
-    if #ml == 0 then ml = { "none in this sea" } end
+    local ms = MATERIALS[s]
+    if ms then
+        for i = 1, #ms do ml[#ml + 1] = ms[i][1] .. "  (" .. ms[i][2] .. ")" end
+    else
+        ml = { "none in this sea" }
+    end
     setMatOptions(ml)
     S.MaterialIndex = 1
 
-    log("rebuilt lists for Sea " .. s)
+    resetFarmState()
+    log("lists rebuilt for Sea " .. s)
 end
 
 rebuildForSea(sea())
@@ -1952,7 +2033,7 @@ task.spawn(function()
         if s ~= last then
             last = s
             rebuildForSea(s)
-            notify("Sea change detected - lists rebuilt for Sea " .. s)
+            notify("Sea change detected - rebuilt for Sea " .. s)
         end
     end
 end)
@@ -2007,11 +2088,20 @@ task.spawn(function()
             if S[watch[i]] then bits[#bits + 1] = watch[i] end
         end
         local q = currentQuest()
-        local okCount, cnt = pcall(function() return enemies() and #enemies():GetChildren() or 0 end)
+        local cnt = 0
+        local f = enemies()
+        if f then cnt = #f:GetChildren() end
+        local dist = "-"
+        local h = hrp()
+        if target and target.Parent and h then
+            local p = target:FindFirstChild("HumanoidRootPart")
+            if p then dist = string.format("%.0f", (p.Position - h.Position).Magnitude) end
+        end
         Status.Text = (#bits > 0 and table.concat(bits, " · ") or "idle")
             .. "  |  Sea " .. sea() .. "  Lv " .. level()
             .. "  |  quest: " .. (q and q.mob or "-")
-            .. "  |  mobs: " .. tostring(okCount and cnt or 0)
+            .. "  |  target dist: " .. dist
+            .. "  |  mobs: " .. cnt
             .. "  |  hitId: " .. tostring(Net.hitId and "ok" or "none")
     end
 end)
@@ -2019,4 +2109,4 @@ end)
 if getgenv then getgenv().VeniceHub = { Gui = Gui, Config = S } end
 installHitCapture()
 applyStats()
-notify("Venice Hub v4 loaded  ·  RightControl to toggle", "Blox Fruits")
+notify("Venice Hub v5 loaded  ·  RightControl to toggle", "Blox Fruits")
