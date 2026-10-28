@@ -1,25 +1,26 @@
 --[[=====================================================================
-  VENICE HUB v3  ·  BLOX FRUITS  ·  Xeno / UNC
+  VENICE HUB v4  ·  BLOX FRUITS  ·  Xeno / UNC / Solara / Delta
   RightControl = toggle UI   |   RightShift = unload
-  Movement is tween-based (anti-cheat safe). Hits carry a captured hitId.
+  Tween-based movement (anti-cheat safe). Hits carry a validated hitId.
+  Requires level 1+. Sea detection is automatic.
 =====================================================================]]
 
-local Players    = game:GetService("Players")
-local RS         = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local UIS        = game:GetService("UserInputService")
-local Tween      = game:GetService("TweenService")
-local StarterGui = game:GetService("StarterGui")
-local VirtualUser= game:GetService("VirtualUser")
-local VIM        = game:GetService("VirtualInputManager")
-local Http       = game:GetService("HttpService")
-local Lighting   = game:GetService("Lighting")
-local TeleportSvc= game:GetService("TeleportService")
-local TCS        = game:GetService("TextChatService")
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local RunService  = game:GetService("RunService")
+local UIS         = game:GetService("UserInputService")
+local Tween       = game:GetService("TweenService")
+local StarterGui  = game:GetService("StarterGui")
+local VirtualUser = game:GetService("VirtualUser")
+local VIM         = game:GetService("VirtualInputManager")
+local Http        = game:GetService("HttpService")
+local Lighting    = game:GetService("Lighting")
+local TeleportSvc = game:GetService("TeleportService")
 
 local LP = Players.LocalPlayer
-local PLACE_ID = 2753915549
+if not LP then return end
 
+-- clean previous instance
 if getgenv and getgenv().VeniceHub and getgenv().VeniceHub.Gui then
     pcall(function() getgenv().VeniceHub.Gui:Destroy() end)
 end
@@ -31,46 +32,68 @@ local function log(...)
 end
 local function notify(text, title)
     pcall(function()
-        StarterGui:SetCore("SendNotification", { Title = title or "Venice Hub",
-            Text = tostring(text), Duration = 5 })
+        StarterGui:SetCore("SendNotification", {
+            Title = title or "Venice Hub", Text = tostring(text), Duration = 5 })
     end)
     log(text)
 end
 
 --=====================================================================
---  NET  ·  real hit pipeline + hitId capture
+--  NET  ·  RegisterAttack / RegisterHit + hitId capture
 --=====================================================================
-local Net = getgenv and getgenv().VeniceHubNet
-if not Net then
-    Net = { hitId = nil, hooked = false, combo = 0 }
-    if getgenv then getgenv().VeniceHubNet = Net end
-end
+local Net = (getgenv and getgenv().VeniceHubNet) or { hitId = nil, hooked = false, combo = 0, fallbackTried = false }
+if getgenv then getgenv().VeniceHubNet = Net end
 
+local RA_cache, RH_cache
 local function netModules()
+    if RA_cache and RH_cache and RA_cache.Parent and RH_cache.Parent then
+        return RA_cache, RH_cache
+    end
     local mods = RS:FindFirstChild("Modules")
     local n = mods and mods:FindFirstChild("Net")
     if not n then return nil, nil end
-    return n:FindFirstChild("RE/RegisterAttack"), n:FindFirstChild("RE/RegisterHit")
+    RA_cache = n:FindFirstChild("RE/RegisterAttack")
+    RH_cache = n:FindFirstChild("RE/RegisterHit")
+    return RA_cache, RH_cache
 end
 
 local function installHitCapture()
-    if Net.hooked then return end
+    if Net.hooked then return true end
     local _, RegisterHit = netModules()
-    if not (RegisterHit and hookmetamethod and getnamecallmethod and checkcaller and newcclosure) then
-        log("hitId capture unavailable (no hook API)")
-        return
+    if not RegisterHit then return false end
+    if not (hookmetamethod and getnamecallmethod and checkcaller and newcclosure) then
+        log("hitId capture unavailable (missing hook API)")
+        return false
     end
     local old
     old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         if not checkcaller() and getnamecallmethod() == "FireServer" and self == RegisterHit then
             local a = table.pack(...)
-            if a[4] ~= nil then Net.hitId = a[4]
-            elseif a.n == 1 and type(a[1]) == "string" then Net.hitId = a[1] end
+            if a[4] ~= nil then
+                Net.hitId = a[4]
+            elseif a.n == 1 and type(a[1]) == "string" then
+                Net.hitId = a[1]
+            end
         end
         return old(self, ...)
     end))
     Net.hooked = true
     log("hitId capture installed")
+    return true
+end
+
+-- fallback id if the hook never sees a real one (fresh account / no manual M1 yet)
+local function ensureHitId()
+    if Net.hitId then return Net.hitId end
+    if Net.fallbackTried then return nil end
+    Net.fallbackTried = true
+    local _, RegisterHit = netModules()
+    if not RegisterHit then return nil end
+    local id = tostring(LP.UserId):sub(2, 4) .. tostring(math.floor(os.clock() * 100000))
+    pcall(function() RegisterHit:FireServer(id) end)
+    Net.hitId = id
+    log("hitId fallback generated: " .. id)
+    return id
 end
 
 local Remotes = RS:FindFirstChild("Remotes") or RS:WaitForChild("Remotes", 30)
@@ -87,29 +110,39 @@ local function invoke(...)
     return ok and res or nil
 end
 
+-- retry hook installation until Modules.Net exists
+task.spawn(function()
+    for _ = 1, 40 do
+        if Net.hooked or installHitCapture() then break end
+        task.wait(0.5)
+    end
+end)
+
 --=====================================================================
 --  CONFIG
 --=====================================================================
 local CONFIG_DIR  = "VeniceHub"
 local CONFIG_FILE = CONFIG_DIR .. "/bloxfruits.json"
+local WP_FILE     = CONFIG_DIR .. "/waypoints.json"
 
 local S = {
     FlySpeed = 200, HeightOffset = 12, HoverRange = 250, AttackInterval = 0.2,
-    AutoFarm = false, FarmNearest = false, BossFarm = false, BringMob = false,
-    AutoEquip = false, EquipType = "Melee", AutoPoints = false, Stat = "Melee", StatAmount = 1,
-    QuestIndex = 0, BossIndex = 1, MaterialIndex = 1, AutoSaber = false,
-    AutoChest = false, AutoLoot = false, ChestSpeed = 350,
+    AutoFarm = false, FarmNearest = false, BossFarm = false,
+    BringMob = false, AutoEquip = false, EquipType = "Melee",
+    QuestIndex = 0, BossIndex = 1, MaterialIndex = 1, MaterialFarm = false,
+    AutoPoints = false, Stat = "Melee", StatAmount = 1,
+    AutoChest = false, AutoLoot = false, AutoFruit = false,
+    CollectSpeed = 350, LootRange = 600,
     FastAttack = false, KillAura = false, AuraRange = 60, LOS = true,
-    AttackPlayers = false, PlayerRange = 60, Aimbot = false, AimSmooth = 15,
+    AttackPlayers = false, PlayerRange = 60,
+    Aimbot = false, AimSmooth = 15, Follow = false, Duel1v1 = false, Spectate = false,
     AutoSkills = false, SkillInterval = 250,
     KeyZ = true, KeyX = true, KeyC = false, KeyV = false, KeyF = false,
-    Follow = false, Duel1v1 = false, Spectate = false,
     AutoBounty = false, BountyTeam = "Both", BountyMethod = "Nearest",
-    NoFriends = true, NoCup = true, SafeHP = 20, MaxTime = 20, NoStun = false,
+    NoFriends = true, NoCup = true, NoStun = false, SafeHP = 20,
     Speed = 16, Jump = 50, InfEnergy = false, Noclip = false, Fly = false,
     AutoBuso = false, AutoKen = false, AntiAFK = true, Fullbright = false,
     ESPMobs = false, ESPPlayers = false, ESPChests = false, ESPFruits = false,
-    AutoFruit = false, FruitSnipe = false,
     IslandIndex = 1, BossTPIndex = 1,
 }
 
@@ -125,7 +158,7 @@ local function loadConfig()
     pcall(function()
         if not isfile(CONFIG_FILE) then return end
         for k, v in pairs(Http:JSONDecode(readfile(CONFIG_FILE))) do
-            if S[k] ~= nil then S[k] = v end
+            if S[k] ~= nil and type(S[k]) == type(v) then S[k] = v end
         end
     end)
 end
@@ -134,7 +167,6 @@ loadConfig()
 --=====================================================================
 --  HELPERS
 --=====================================================================
-local function char() local c = LP.Character; return c and c.Parent and c or nil end
 local function hrp() local c = LP.Character; return c and c:FindFirstChild("HumanoidRootPart") end
 local function hum() local c = LP.Character; return c and c:FindFirstChildOfClass("Humanoid") end
 local function level()
@@ -152,22 +184,22 @@ local function ping()
 end
 local function sea()
     local id = game.PlaceId
-    if id == 2753915549 then return 1 end
     if id == 4442272183 then return 2 end
     if id == 7449423635 then return 3 end
     return 1
 end
 
 --=====================================================================
---  TELEPORT  ·  tween based, never anchors
+--  TELEPORT  ·  tween-based, never anchors
 --=====================================================================
 local activeTween
 local function tpCancel()
     if activeTween then pcall(function() activeTween:Cancel() end) activeTween = nil end
 end
 local function tpGo(pos, speed)
+    if not pos then return end
     local h = hrp()
-    if not h or not pos then return end
+    if not h then return end
     local dist = (h.Position - pos).Magnitude
     local t = math.clamp(dist / math.max(speed or S.FlySpeed, 1), 0.05, 90)
     tpCancel()
@@ -177,7 +209,6 @@ local function tpGo(pos, speed)
     tw:Play()
     return tw
 end
--- while tweening: kill velocity + noclip (never Anchor — the game rejects hits from anchored chars)
 RunService.Heartbeat:Connect(function()
     if not activeTween then return end
     local c = LP.Character
@@ -191,7 +222,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 --=====================================================================
---  DATA  ·  islands / bosses / quests / spawns  (current as of Oct 2026)
+--  DATA
 --=====================================================================
 local ISLANDS = {
     [1] = {
@@ -424,7 +455,7 @@ local MATERIALS = {
 }
 
 --=====================================================================
---  ENEMY / ITEM QUERIES
+--  QUERIES
 --=====================================================================
 local function mobsNamed(name)
     local out, f = {}, enemies()
@@ -440,7 +471,7 @@ end
 
 local function nearestMob(name)
     local h, f = hrp(), enemies()
-    if not h or not f then return end
+    if not h or not f then return nil end
     local best, bd
     for _, e in ipairs(f:GetChildren()) do
         if e.Name:lower() == name:lower() then
@@ -457,7 +488,7 @@ end
 
 local function nearestAnyMob(range)
     local h, f = hrp(), enemies()
-    if not h or not f then return end
+    if not h or not f then return nil end
     local best, bd
     for _, e in ipairs(f:GetChildren()) do
         local hu = e:FindFirstChildOfClass("Humanoid")
@@ -484,9 +515,29 @@ local function getChests()
     return out
 end
 
-local function isFruitTool(t)
-    local o = t:GetAttribute("OriginalName")
-    return (o and tostring(o):find("%-") ~= nil) or t.ToolTip == "Blox Fruit"
+local FRUIT_SET = {}
+do
+    local names = {
+        "Rocket","Spin","Chop","Spring","Bomb","Smoke","Spike","Flame","Falcon","Ice","Sand","Dark",
+        "Diamond","Light","Rubber","Barrier","Ghost","Magma","Door","Blizzard","Gravity","Mammoth",
+        "T-Rex","Dough","Shadow","Venom","Control","Spirit","Dragon","Leopard","Kitsune","Buddha",
+        "Portal","Rumble","Paw","Sound","Phoenix","Pain","Love","Creation","Spider","Magnet","Yeti",
+        "Gas","Revive","Eagle","Wolf","Quake","Lightning","Gem","Rift",
+    }
+    for _, f in ipairs(names) do
+        FRUIT_SET[f] = true
+        FRUIT_SET[f .. "-" .. f] = true
+    end
+end
+
+local function isFruitPart(v)
+    if not v:FindFirstChild("Handle") then return false end
+    local o = v:GetAttribute("OriginalName")
+    if o and tostring(o):find("%-") then return true end
+    if FRUIT_SET[v.Name] then return true end
+    local base = v.Name:match("^(.-)%-")
+    if base and FRUIT_SET[base] then return true end
+    return false
 end
 
 local function getGroundFruits()
@@ -494,19 +545,33 @@ local function getGroundFruits()
     local function scan(cont)
         if not cont then return end
         for _, v in ipairs(cont:GetChildren()) do
-            if (v:IsA("Model") or v:IsA("Tool")) and v:FindFirstChild("Handle") then
-                local o = v:GetAttribute("OriginalName")
-                local nm = v.Name
-                if (o and tostring(o):find("%-")) or nm:find("%-") or (nm:find("Fruit")) then
-                    local hd = v.Handle
-                    out[#out + 1] = { model = v, part = hd, name = nm,
-                        d = h and (hd.Position - h.Position).Magnitude or 0 }
-                end
+            if (v:IsA("Model") or v:IsA("Tool")) and isFruitPart(v) then
+                local hd = v.Handle
+                out[#out + 1] = { model = v, part = hd, name = v.Name,
+                    d = h and (hd.Position - h.Position).Magnitude or 0 }
             end
         end
     end
     scan(workspace)
-    scan(locations())
+    for _, c in ipairs(workspace:GetChildren()) do
+        if c:IsA("Folder") then scan(c) end
+    end
+    return out
+end
+
+local function getLoot(range)
+    local out, h = {}, hrp()
+    if not h then return out end
+    for _, v in ipairs(workspace:GetChildren()) do
+        if (v:IsA("Model") or v:IsA("Tool")) and v:FindFirstChild("Handle") and not isFruitPart(v) then
+            local n = v.Name:lower()
+            if not (n:find("chest") or n:find("barrel")) then
+                local hd = v.Handle
+                local d = (hd.Position - h.Position).Magnitude
+                if d <= (range or 600) then out[#out + 1] = { part = hd, d = d } end
+            end
+        end
+    end
     return out
 end
 
@@ -529,6 +594,11 @@ local function ensureNotRod()
     end
 end
 
+local function isFruitTool(t)
+    local o = t:GetAttribute("OriginalName")
+    return (o and tostring(o):find("%-") ~= nil) or t.ToolTip == "Blox Fruit"
+end
+
 local function equipKind(kind)
     local c = LP.Character
     local h = c and c:FindFirstChildOfClass("Humanoid")
@@ -542,42 +612,53 @@ local function equipKind(kind)
     for _, pool in ipairs({ c, LP:FindFirstChild("Backpack") }) do
         if pool then
             for _, t in ipairs(pool:GetChildren()) do
-                if t:IsA("Tool") and match(t) then pcall(function() h:EquipTool(t) end) return end
+                if t:IsA("Tool") and match(t) then
+                    pcall(function() h:EquipTool(t) end)
+                    return
+                end
             end
         end
     end
 end
 
 local function attackOnce(enemy)
-    if not enemy then return end
-    ensureNotRod()
+    if not enemy or not enemy.Parent then return end
     local RA, RH = netModules()
     if not (RA and RH) then return end
     local p = enemy:FindFirstChild("HumanoidRootPart") or enemy.PrimaryPart
         or enemy:FindFirstChildWhichIsA("BasePart")
     if not p then return end
+    ensureNotRod()
+    local id = ensureHitId()
     Net.combo = (Net.combo % 4) + 1
-    RA:FireServer(0.4, Net.combo)
-    RH:FireServer(p, {}, nil, Net.hitId)
+    pcall(function()
+        RA:FireServer(0.4, Net.combo)
+        RH:FireServer(p, {}, nil, id)
+    end)
 end
 
 local function attackMany(list)
     if #list == 0 then return end
-    ensureNotRod()
     local RA, RH = netModules()
     if not (RA and RH) then return end
+    ensureNotRod()
+    local id = ensureHitId()
     Net.combo = (Net.combo % 4) + 1
-    RA:FireServer(0.4, Net.combo)
-    for _, e in ipairs(list) do
-        local p = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
-        if p then RH:FireServer(p, {}, nil, Net.hitId) end
-    end
+    pcall(function()
+        RA:FireServer(0.4, Net.combo)
+        for _, e in ipairs(list) do
+            local p = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
+            if p then RH:FireServer(p, {}, nil, id) end
+        end
+    end)
 end
 
 local function losClear(from, part, ignore)
+    local filter = { LP.Character }
+    if ignore then filter[#filter + 1] = ignore end
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Exclude
-    rp.FilterDescendantsInstances = { LP.Character, ignore }
+    rp.FilterDescendantsInstances = filter
     return workspace:Raycast(from, part.Position - from, rp) == nil
 end
 
@@ -585,7 +666,7 @@ local function playersInRange(range)
     local h, out = hrp(), {}
     if not h then return out end
     for _, p in ipairs(Players:GetPlayers()) do
-        local c = p ~= LP and p.Character
+        local c = (p ~= LP) and p.Character
         local ph = c and c:FindFirstChild("HumanoidRootPart")
         local hu = c and c:FindFirstChildOfClass("Humanoid")
         if ph and hu and hu.Health > 0 and (ph.Position - h.Position).Magnitude <= range then
@@ -595,7 +676,25 @@ local function playersInRange(range)
     return out
 end
 
+local function nearestPlayer(range)
+    local h = hrp()
+    if not h then return nil end
+    local best, bd
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local ph = p.Character:FindFirstChild("HumanoidRootPart")
+            local hu = p.Character:FindFirstChildOfClass("Humanoid")
+            if ph and hu and hu.Health > 0 then
+                local d = (ph.Position - h.Position).Magnitude
+                if (not range or d <= range) and (not bd or d < bd) then best, bd = p, d end
+            end
+        end
+    end
+    return best
+end
+
 local function effDelay() return S.FastAttack and 0.08 or S.AttackInterval end
+
 local function pressKey(name)
     local kc = Enum.KeyCode[name]
     if not kc then return end
@@ -609,10 +708,11 @@ end
 --=====================================================================
 --  FARM
 --=====================================================================
-local bestQ, curKey, target, anchor, killCount, killReq, prevAlive
+local curKey, target, anchor, killCount, killReq, prevAlive, bestQ
 local farmGen = 0
 
-local function questList() return QUESTS[sea()] end
+local function questList() return QUESTS[sea()] or QUESTS[1] end
+
 local function bestQuest()
     local lv, best, list = level(), nil, questList()
     for _, q in ipairs(list) do
@@ -620,21 +720,23 @@ local function bestQuest()
     end
     return best or list[1]
 end
+
 local function currentQuest()
     if S.QuestIndex and S.QuestIndex > 0 then
         return questList()[S.QuestIndex] or bestQuest()
     end
     return bestQuest()
 end
+
 local function startQuest()
     local q = currentQuest()
-    if not q then return end
-    invoke("StartQuest", q.id, q.tier)
+    if q then invoke("StartQuest", q.id, q.tier) end
 end
 
 local function farmStep()
     local q = currentQuest()
     if not q then return end
+    bestQ = q
 
     local list = mobsNamed(q.mob)
     local curr = {}
@@ -709,7 +811,6 @@ local function runFarm()
     end)
 end
 
--- bring-mob renderer
 RunService.RenderStepped:Connect(function()
     if not (S.AutoFarm or S.BossFarm or S.FarmNearest) then return end
     local h = hrp()
@@ -717,14 +818,13 @@ RunService.RenderStepped:Connect(function()
     if h.Anchored then h.Anchored = false end
     h.AssemblyLinearVelocity = Vector3.zero
 
-    if S.BringMob and anchor then
+    if S.BringMob and anchor and bestQ then
         h.CFrame = CFrame.new(anchor + Vector3.new(0, S.HeightOffset, 0))
         h.AssemblyLinearVelocity = Vector3.zero
-        local name = bestQ and bestQ.mob
         local f = enemies()
-        if f and name then
+        if f then
             for _, e in ipairs(f:GetChildren()) do
-                if e.Name:lower() == name:lower() then
+                if e.Name:lower() == bestQ.mob:lower() then
                     local hu = e:FindFirstChildOfClass("Humanoid")
                     local ep = e:FindFirstChild("HumanoidRootPart") or e.PrimaryPart
                     if hu and hu.Health > 0 and ep then
@@ -737,8 +837,8 @@ RunService.RenderStepped:Connect(function()
                 end
             end
         end
-    elseif target then
-        local p = target.Parent and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart)
+    elseif target and target.Parent then
+        local p = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
         if p and (p.Position - h.Position).Magnitude < S.HoverRange then
             h.CFrame = CFrame.new(p.Position + Vector3.new(0, S.HeightOffset, 0))
             h.AssemblyLinearVelocity = Vector3.zero
@@ -749,6 +849,8 @@ end)
 --=====================================================================
 --  LOOPS
 --=====================================================================
+local function othersFarming() return S.AutoFarm or S.BossFarm or S.FarmNearest end
+
 task.spawn(function()  -- farm nearest
     while true do
         if S.FarmNearest and LP.Character then
@@ -776,7 +878,8 @@ end)
 task.spawn(function()  -- boss farm
     while true do
         if S.BossFarm and LP.Character then
-            local b = BOSSES[sea()][S.BossIndex]
+            local list = BOSSES[sea()] or BOSSES[1]
+            local b = list[math.clamp(S.BossIndex, 1, #list)]
             if b then
                 local t = nearestMob(b[1])
                 if t then
@@ -828,24 +931,46 @@ end)
 task.spawn(function()  -- auto skills
     while true do
         if S.AutoSkills and LP.Character then
-            for k, on in pairs({ Z = S.KeyZ, X = S.KeyX, C = S.KeyC, V = S.KeyV, F = S.KeyF }) do
-                if on and not S.AutoSkills then break end
-                if on then pressKey(k) end
+            local order = { { "Z", S.KeyZ }, { "X", S.KeyX }, { "C", S.KeyC },
+                            { "V", S.KeyV }, { "F", S.KeyF } }
+            for _, e in ipairs(order) do
+                if not S.AutoSkills then break end
+                if e[2] then pressKey(e[1]) end
             end
         end
         task.wait(S.SkillInterval / 1000)
     end
 end)
 
-task.spawn(function()  -- auto chests
+task.spawn(function()  -- chests
     while true do
-        if S.AutoChest and not S.AutoFarm and LP.Character then
+        if S.AutoChest and not othersFarming() and LP.Character then
             local list = getChests()
             if #list > 0 then
                 table.sort(list, function(a, b) return a.d < b.d end)
                 for _, c in ipairs(list) do
-                    if not S.AutoChest then break end
-                    tpGo(c.part.Position + Vector3.new(0, 4, 0), S.ChestSpeed)
+                    if not S.AutoChest or othersFarming() then break end
+                    tpGo(c.part.Position + Vector3.new(0, 4, 0), S.CollectSpeed)
+                    task.wait(0.15)
+                end
+            else
+                task.wait(0.4)
+            end
+        else
+            task.wait(0.3)
+        end
+    end
+end)
+
+task.spawn(function()  -- loot
+    while true do
+        if S.AutoLoot and not othersFarming() and LP.Character then
+            local list = getLoot(S.LootRange)
+            if #list > 0 then
+                table.sort(list, function(a, b) return a.d < b.d end)
+                for _, it in ipairs(list) do
+                    if not S.AutoLoot or othersFarming() then break end
+                    tpGo(it.part.Position + Vector3.new(0, 3, 0), S.CollectSpeed)
                     task.wait(0.12)
                 end
             else
@@ -857,14 +982,14 @@ task.spawn(function()  -- auto chests
     end
 end)
 
-task.spawn(function()  -- auto fruit
+task.spawn(function()  -- fruit
     while true do
-        if S.AutoFruit and LP.Character then
+        if S.AutoFruit and not othersFarming() and LP.Character then
             local f = getGroundFruits()
             if #f > 0 then
                 table.sort(f, function(a, b) return a.d < b.d end)
-                tpGo(f[1].part.Position + Vector3.new(0, 3, 0), S.ChestSpeed)
-                task.wait(0.2)
+                tpGo(f[1].part.Position + Vector3.new(0, 3, 0), S.CollectSpeed)
+                task.wait(0.25)
             else
                 task.wait(0.5)
             end
@@ -874,11 +999,12 @@ task.spawn(function()  -- auto fruit
     end
 end)
 
-task.spawn(function()  -- auto buso / ken
+task.spawn(function()  -- haki
     while true do
-        if LP.Character then
-            if S.AutoBuso and not LP.Character:FindFirstChild("HasBuso") then invoke("Buso") end
-            if S.AutoKen and not LP.Character:FindFirstChild("HasKen") then invoke("Ken") end
+        local c = LP.Character
+        if c then
+            if S.AutoBuso and not c:FindFirstChild("HasBuso") then invoke("Buso") end
+            if S.AutoKen and not c:FindFirstChild("HasKen") then invoke("Ken") end
         end
         task.wait(0.5)
     end
@@ -897,7 +1023,7 @@ task.spawn(function()  -- auto points
     end
 end)
 
-task.spawn(function()  -- auto bounty
+task.spawn(function()  -- bounty
     while true do
         if S.AutoBounty and LP.Character then
             local h = hrp()
@@ -909,19 +1035,25 @@ task.spawn(function()  -- auto bounty
             else
                 local best, bd
                 for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= LP and p.Character then
+                    if p ~= LP and p.Character and h then
                         local ph = p.Character:FindFirstChild("HumanoidRootPart")
                         local phu = p.Character:FindFirstChildOfClass("Humanoid")
-                        if ph and phu and phu.Health > 0 and h then
-                            local okf, isf = pcall(function() return LP:IsFriendsWith(p.UserId) end)
-                            local skip = (S.NoFriends and okf and isf)
-                            if S.NoCup then
+                        if ph and phu and phu.Health > 0 then
+                            local skip = false
+                            if S.NoFriends then
+                                local okf, isf = pcall(function() return LP:IsFriendsWith(p.UserId) end)
+                                if okf and isf then skip = true end
+                            end
+                            if S.NoCup and not skip then
                                 for _, t in ipairs(p.Character:GetChildren()) do
                                     if t:IsA("Tool") and t.Name == "Cup" then skip = true end
                                 end
                             end
+                            if S.BountyTeam ~= "Both" and p.Team then
+                                if not p.Team.Name:lower():find(S.BountyTeam:lower()) then skip = true end
+                            end
                             if not skip then
-                                local d = S.BountyMethod == "Lowest HP" and phu.Health
+                                local d = (S.BountyMethod == "Lowest HP") and phu.Health
                                     or (ph.Position - h.Position).Magnitude
                                 if not bd or d < bd then best, bd = p, d end
                             end
@@ -943,69 +1075,32 @@ task.spawn(function()  -- auto bounty
     end
 end)
 
-task.spawn(function()  -- follow / spectate / aimbot
+task.spawn(function()  -- camera: aimbot / spectate / follow
     while true do
         local cam = workspace.CurrentCamera
-        if S.Aimbot and cam then
-            local h = hrp()
-            local best, bd
-            if h then
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= LP and p.Character then
-                        local ph = p.Character:FindFirstChild("HumanoidRootPart")
-                        if ph then
-                            local d = (ph.Position - h.Position).Magnitude
-                            if not bd or d < bd then best, bd = p, d end
-                        end
-                    end
-                end
-            end
-            if best and best.Character then
-                local ph = best.Character:FindFirstChild("HumanoidRootPart")
+        if cam then
+            if S.Aimbot then
+                local p = nearestPlayer(1e9)
+                local ph = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
                 if ph then
                     cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position, ph.Position), S.AimSmooth / 100)
                 end
             end
-        end
-        if S.Spectate and cam then
-            local best, bd
-            local h = hrp()
-            if h then
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= LP and p.Character then
-                        local ph = p.Character:FindFirstChild("HumanoidRootPart")
-                        if ph then
-                            local d = (ph.Position - h.Position).Magnitude
-                            if not bd or d < bd then best, bd = p, d end
-                        end
-                    end
-                end
+            if S.Spectate then
+                local p = nearestPlayer(1e9)
+                local phu = p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+                if phu then cam.CameraSubject = phu end
+            else
+                local myH = hum()
+                if myH and cam.CameraSubject ~= myH then cam.CameraSubject = myH end
             end
-            local phu = best and best.Character and best.Character:FindFirstChildOfClass("Humanoid")
-            if phu then cam.CameraSubject = phu end
-        elseif cam and hum() then
-            cam.CameraSubject = hum()
         end
         if S.Follow and LP.Character then
-            local best, bd
-            local h = hrp()
-            if h then
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= LP and p.Character then
-                        local ph = p.Character:FindFirstChild("HumanoidRootPart")
-                        if ph then
-                            local d = (ph.Position - h.Position).Magnitude
-                            if not bd or d < bd then best, bd = p, d end
-                        end
-                    end
-                end
-            end
-            if best and best.Character then
-                local ph = best.Character:FindFirstChild("HumanoidRootPart")
-                if ph then
-                    tpGo(ph.Position + ph.CFrame.LookVector * -6)
-                    if S.Duel1v1 then attackOnce(best.Character) end
-                end
+            local p = nearestPlayer(1e9)
+            local ph = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+            if ph then
+                tpGo(ph.Position + ph.CFrame.LookVector * -6)
+                if S.Duel1v1 then attackOnce(p.Character) end
             end
         end
         task.wait(0.2)
@@ -1014,11 +1109,14 @@ end)
 
 task.spawn(function()  -- no stun
     while true do
-        if S.NoStun and LP.Character then
-            local h = LP.Character:FindFirstChildOfClass("Humanoid")
-            if h and h.PlatformStand then h.PlatformStand = false end
-            for _, a in ipairs({ "Stun", "Stunned" }) do
-                if LP.Character:GetAttribute(a) then LP.Character:SetAttribute(a, false) end
+        if S.NoStun then
+            local c = LP.Character
+            if c then
+                local h = c:FindFirstChildOfClass("Humanoid")
+                if h and h.PlatformStand then h.PlatformStand = false end
+                for _, a in ipairs({ "Stun", "Stunned" }) do
+                    if c:GetAttribute(a) then c:SetAttribute(a, false) end
+                end
             end
         end
         task.wait(0.1)
@@ -1030,7 +1128,11 @@ end)
 --=====================================================================
 local function applyStats()
     local h = hum()
-    if h then h.WalkSpeed = S.Speed h.UseJumpPower = true h.JumpPower = S.Jump end
+    if h then
+        h.WalkSpeed = S.Speed
+        h.UseJumpPower = true
+        h.JumpPower = S.Jump
+    end
 end
 LP.CharacterAdded:Connect(function() task.wait(1.5) applyStats() end)
 
@@ -1051,16 +1153,21 @@ local function startFly()
     local hu = hum()
     if hu then hu.PlatformStand = true end
     flyBV = Instance.new("BodyVelocity")
-    flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9) flyBV.P = 1e4
-    flyBV.Velocity = Vector3.zero flyBV.Parent = h
+    flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    flyBV.P = 1e4
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = h
     flyBG = Instance.new("BodyGyro")
-    flyBG.MaxTorque = Vector3.new(9e9, 9e9, 9e9) flyBG.P = 1e4
-    flyBG.CFrame = h.CFrame flyBG.Parent = h
+    flyBG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    flyBG.P = 1e4
+    flyBG.CFrame = h.CFrame
+    flyBG.Parent = h
 end
 local function stopFly()
     if flyBV then flyBV:Destroy() flyBV = nil end
     if flyBG then flyBG:Destroy() flyBG = nil end
-    local hu = hum() if hu then hu.PlatformStand = false end
+    local hu = hum()
+    if hu then hu.PlatformStand = false end
 end
 
 RunService.RenderStepped:Connect(function()
@@ -1085,9 +1192,11 @@ task.spawn(function()
     while task.wait(0.4) do
         if S.InfEnergy and LP.Character then
             pcall(function()
-                local e = LP:FindFirstChild("Energy") if e then e.Value = 1e6 end
+                local e = LP:FindFirstChild("Energy")
+                if e then e.Value = 1e6 end
                 local d = LP:FindFirstChild("Data")
-                local de = d and d:FindFirstChild("Energy") if de then de.Value = 1e6 end
+                local de = d and d:FindFirstChild("Energy")
+                if de then de.Value = 1e6 end
             end)
         end
     end
@@ -1098,10 +1207,14 @@ local function setESP(inst, color, on)
     if on then
         if not ex then
             local h = Instance.new("Highlight")
-            h.Name = "VeniceESP" h.FillColor = color h.OutlineColor = color
-            h.FillTransparency = 0.65 h.OutlineTransparency = 0
+            h.Name = "VeniceESP"
+            h.FillColor = color
+            h.OutlineColor = color
+            h.FillTransparency = 0.65
+            h.OutlineTransparency = 0
             h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-            h.Adornee = inst h.Parent = inst
+            h.Adornee = inst
+            h.Parent = inst
         else
             ex.FillColor = color
         end
@@ -1134,8 +1247,10 @@ task.spawn(function()
                 end
             end
         end
-        for _, fr in ipairs(getGroundFruits()) do
-            setESP(fr.model, Color3.fromRGB(170, 100, 255), S.ESPFruits)
+        if S.ESPFruits then
+            for _, fr in ipairs(getGroundFruits()) do
+                setESP(fr.model, Color3.fromRGB(170, 100, 255), true)
+            end
         end
     end
 end)
@@ -1171,18 +1286,21 @@ local function padding(p, x)
 end
 local function vlist(p, sp)
     return make("UIListLayout", { FillDirection = Enum.FillDirection.Vertical,
-        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, sp or 6), Parent = p })
+        SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, sp or 5), Parent = p })
 end
 
 local Gui = make("ScreenGui", { Name = "VeniceHub", ResetOnSpawn = false,
     IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
-local okP = pcall(function() Gui.Parent = (getgenv and gethui and gethui()) or LP:WaitForChild("PlayerGui") end)
+local okP = pcall(function()
+    Gui.Parent = (getgenv and gethui and gethui()) or LP:WaitForChild("PlayerGui")
+end)
 if not okP or not Gui.Parent then Gui.Parent = LP:WaitForChild("PlayerGui") end
 
 local Main = make("Frame", { Name = "Main", Size = UDim2.new(0, 620, 0, 420),
     Position = UDim2.new(0.5, -310, 0.5, -210), BackgroundColor3 = Theme.BG,
     BorderSizePixel = 0, Parent = Gui })
-corner(Main, 10) stroke(Main)
+corner(Main, 10)
+stroke(Main)
 
 local Bar = make("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Panel,
     BorderSizePixel = 0, Parent = Main })
@@ -1191,7 +1309,7 @@ make("Frame", { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 1, -12
     BackgroundColor3 = Theme.Panel, BorderSizePixel = 0, Parent = Bar })
 make("TextLabel", { Size = UDim2.new(1, -100, 1, 0), Position = UDim2.new(0, 14, 0, 0),
     BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Theme.Text,
-    TextXAlignment = Enum.TextXAlignment.Left, Text = "VENICE HUB v3  ·  BLOX FRUITS", Parent = Bar })
+    TextXAlignment = Enum.TextXAlignment.Left, Text = "VENICE HUB v4  ·  BLOX FRUITS", Parent = Bar })
 
 local TabHolder = make("Frame", { Size = UDim2.new(0, 128, 1, -66), Position = UDim2.new(0, 8, 0, 38),
     BackgroundTransparency = 1, Parent = Main })
@@ -1236,11 +1354,14 @@ local function Section(parent, text)
         TextXAlignment = Enum.TextXAlignment.Left, Text = string.upper(text), Parent = parent })
 end
 
-local function Toggle(parent, text, default, cb)
+local toggleRegistry = {}
+
+local function Toggle(parent, text, default, cb, key)
     local f = make("Frame", { Size = UDim2.new(1, 0, 0, 27), BackgroundColor3 = Theme.Panel, Parent = parent })
-    corner(f, 6) stroke(f)
+    corner(f, 6)
+    stroke(f)
     make("TextLabel", { Size = UDim2.new(1, -54, 1, 0), Position = UDim2.new(0, 9, 0, 0),
-        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11.5, TextColor3 = Theme.Text,
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Text,
         TextXAlignment = Enum.TextXAlignment.Left, Text = text, Parent = f })
     local track = make("Frame", { Size = UDim2.new(0, 34, 0, 16), Position = UDim2.new(1, -44, 0.5, -8),
         BackgroundColor3 = Theme.Stroke, Parent = f })
@@ -1248,27 +1369,41 @@ local function Toggle(parent, text, default, cb)
     local knob = make("Frame", { Size = UDim2.new(0, 12, 0, 12), Position = UDim2.new(0, 2, 0.5, -6),
         BackgroundColor3 = Theme.Text, Parent = track })
     corner(knob, 6)
+
     local state = default and true or false
     local function render()
         Tween:Create(track, TweenInfo.new(0.13), { BackgroundColor3 = state and Theme.Accent or Theme.Stroke }):Play()
         Tween:Create(knob, TweenInfo.new(0.13), {
             Position = state and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6) }):Play()
     end
+    local function apply(v, fire)
+        state = v and true or false
+        render()
+        if fire and cb then pcall(cb, state) end
+    end
     render()
+
+    if key then
+        toggleRegistry[key] = toggleRegistry[key] or {}
+        table.insert(toggleRegistry[key], function(v) apply(v, false) end)
+    end
+
     local hit = make("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", Parent = f })
     hit.MouseButton1Click:Connect(function()
-        state = not state
-        render()
-        if cb then pcall(cb, state) end
+        apply(not state, true)
+        if key and toggleRegistry[key] then
+            for _, fn in ipairs(toggleRegistry[key]) do fn(state) end
+        end
         saveConfig()
     end)
-    return f
+    return f, function(v) apply(v, false) end
 end
 
 local function Button(parent, text, cb)
     local b = make("TextButton", { Size = UDim2.new(1, 0, 0, 25), BackgroundColor3 = Theme.Panel2,
-        Text = text, Font = Enum.Font.GothamMedium, TextSize = 11.5, TextColor3 = Theme.Text, Parent = parent })
-    corner(b, 6) stroke(b)
+        Text = text, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Theme.Text, Parent = parent })
+    corner(b, 6)
+    stroke(b)
     b.MouseButton1Click:Connect(function()
         local ok, err = pcall(cb)
         if not ok then notify("Button error: " .. tostring(err)) end
@@ -1278,12 +1413,13 @@ end
 
 local function Slider(parent, text, min, max, default, cb)
     local f = make("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Theme.Panel, Parent = parent })
-    corner(f, 6) stroke(f)
+    corner(f, 6)
+    stroke(f)
     make("TextLabel", { Size = UDim2.new(0.62, 0, 0, 18), Position = UDim2.new(0, 9, 0, 1),
-        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11.5, TextColor3 = Theme.Text,
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Text,
         TextXAlignment = Enum.TextXAlignment.Left, Text = text, Parent = f })
     local vL = make("TextLabel", { Size = UDim2.new(0.33, -9, 0, 18), Position = UDim2.new(0.66, 0, 0, 1),
-        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 11.5, TextColor3 = Theme.Accent,
+        BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Theme.Accent,
         TextXAlignment = Enum.TextXAlignment.Right, Text = "", Parent = f })
     local bar = make("Frame", { Size = UDim2.new(1, -18, 0, 5), Position = UDim2.new(0, 9, 1, -14),
         BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0, Parent = f })
@@ -1309,69 +1445,99 @@ local function Slider(parent, text, min, max, default, cb)
         if drag and i.UserInputType == Enum.UserInputType.MouseMovement then fromMouse() end
     end)
     UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 and drag then drag = false saveConfig() end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 and drag then
+            drag = false
+            saveConfig()
+        end
     end)
     return f
 end
 
 local function Dropdown(parent, text, options, cb)
     local f = make("Frame", { Size = UDim2.new(1, 0, 0, 27), BackgroundColor3 = Theme.Panel, Parent = parent })
-    corner(f, 6) stroke(f)
+    corner(f, 6)
+    stroke(f)
     make("TextLabel", { Size = UDim2.new(0.4, 0, 1, 0), Position = UDim2.new(0, 9, 0, 0),
-        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11.5, TextColor3 = Theme.Sub,
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Sub,
         TextXAlignment = Enum.TextXAlignment.Left, Text = text, Parent = f })
     local val = make("TextButton", { Size = UDim2.new(0.58, -13, 1, -5), Position = UDim2.new(0.41, 0, 0, 2.5),
-        BackgroundColor3 = Theme.Panel2, Font = Enum.Font.GothamMedium, TextSize = 11.5,
+        BackgroundColor3 = Theme.Panel2, Font = Enum.Font.GothamMedium, TextSize = 12,
         TextColor3 = Theme.Text, Text = "", Parent = f })
     corner(val, 5)
-
-    local listH = math.min(#options * 20 + 6, 150)
-    local holder = make("ScrollingFrame", { Size = UDim2.new(1, 0, 0, listH), Position = UDim2.new(0, 0, 0, 29),
+    local holder = make("ScrollingFrame", { Size = UDim2.new(1, 0, 0, 100), Position = UDim2.new(0, 0, 0, 29),
         BackgroundColor3 = Theme.BG, BorderSizePixel = 0, ScrollBarThickness = 3,
-        ScrollBarImageColor3 = Theme.Stroke, CanvasSize = UDim2.new(0, 0, 0, #options * 20 + 6),
+        ScrollBarImageColor3 = Theme.Stroke, CanvasSize = UDim2.new(0, 0, 0, 0),
         Visible = false, Parent = f })
-    corner(holder, 6) stroke(holder)
+    corner(holder, 6)
+    stroke(holder)
     padding(holder, 3)
     vlist(holder, 1)
 
+    local opts = options
     local idx = 1
-    local function render() val.Text = tostring(options[idx]) end
-    render()
+    local listH = 100
+    local open = false
 
+    local function render() val.Text = tostring(opts[idx] or "-") end
     local function close()
+        open = false
         holder.Visible = false
         f.Size = UDim2.new(1, 0, 0, 27)
     end
-    for i, opt in ipairs(options) do
-        local ob = make("TextButton", { Size = UDim2.new(1, 0, 0, 19), BackgroundColor3 = Theme.BG,
-            Text = "  " .. tostring(opt), Font = Enum.Font.Gotham, TextSize = 11,
-            TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = holder })
-        corner(ob, 4)
-        ob.MouseEnter:Connect(function() ob.BackgroundColor3 = Theme.Panel2 end)
-        ob.MouseLeave:Connect(function() ob.BackgroundColor3 = Theme.BG end)
-        ob.MouseButton1Click:Connect(function()
-            idx = i
-            render()
-            close()
-            if cb then pcall(cb, opt, i) end
-            saveConfig()
-        end)
+    local function openList()
+        open = true
+        holder.Visible = true
+        f.Size = UDim2.new(1, 0, 0, 29 + listH)
     end
-    val.MouseButton1Click:Connect(function()
-        if holder.Visible then close() else
-            holder.Visible = true
-            f.Size = UDim2.new(1, 0, 0, 29 + listH)
+    local function buildRows()
+        for _, c in ipairs(holder:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
         end
+        local n = math.max(#opts, 1)
+        listH = math.min(n * 20 + 6, 150)
+        holder.CanvasSize = UDim2.new(0, 0, 0, n * 20 + 6)
+        holder.Size = UDim2.new(1, 0, 0, listH)
+        f.Size = UDim2.new(1, 0, 0, open and (29 + listH) or 27)
+        for i, opt in ipairs(opts) do
+            local ob = make("TextButton", { Size = UDim2.new(1, 0, 0, 19), BackgroundColor3 = Theme.BG,
+                Text = "  " .. tostring(opt), Font = Enum.Font.Gotham, TextSize = 11,
+                TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = holder })
+            corner(ob, 4)
+            ob.MouseEnter:Connect(function() ob.BackgroundColor3 = Theme.Panel2 end)
+            ob.MouseLeave:Connect(function() ob.BackgroundColor3 = Theme.BG end)
+            ob.MouseButton1Click:Connect(function()
+                idx = i
+                render()
+                close()
+                if cb then pcall(cb, opt, i) end
+                saveConfig()
+            end)
+        end
+    end
+
+    val.MouseButton1Click:Connect(function()
+        if open then close() else openList() end
     end)
-    return f, function() return options[idx] end, function() return idx end
+
+    buildRows()
+    render()
+
+    return f, function() return opts[idx] end, function() return idx end, function(newOpts)
+        opts = (#newOpts > 0) and newOpts or { "-" }
+        idx = 1
+        buildRows()
+        render()
+        close()
+    end
 end
 
 local function Textbox(parent, placeholder, cb)
     local t = make("TextBox", { Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Theme.Panel2,
-        Text = "", PlaceholderText = placeholder, Font = Enum.Font.Gotham, TextSize = 11.5,
+        Text = "", PlaceholderText = placeholder, Font = Enum.Font.Gotham, TextSize = 12,
         TextColor3 = Theme.Text, PlaceholderColor3 = Theme.Sub, Parent = parent })
-    corner(t, 6) stroke(t)
-    t.FocusLost:Connect(function() if cb then pcall(cb, t.Text) end end)
+    corner(t, 6)
+    stroke(t)
+    if cb then t.FocusLost:Connect(function() pcall(cb, t.Text) end) end
     return t
 end
 
@@ -1379,27 +1545,25 @@ end
 --  WAYPOINTS
 --=====================================================================
 local waypoints = {}
-do
-    if readfile and isfile then
-        pcall(function()
-            if isfile(CONFIG_DIR .. "/waypoints.json") then
-                local d = Http:JSONDecode(readfile(CONFIG_DIR .. "/waypoints.json"))
-                for _, w in ipairs(d) do
-                    waypoints[#waypoints + 1] = { name = w.name, pos = Vector3.new(w.x, w.y, w.z) }
-                end
+if readfile and isfile then
+    pcall(function()
+        if isfile(WP_FILE) then
+            for _, w in ipairs(Http:JSONDecode(readfile(WP_FILE))) do
+                waypoints[#waypoints + 1] = { name = tostring(w.name),
+                    pos = Vector3.new(tonumber(w.x) or 0, tonumber(w.y) or 0, tonumber(w.z) or 0) }
             end
-        end)
-    end
+        end
+    end)
 end
 local function saveWaypoints()
     if not writefile then return end
     pcall(function()
+        if isfolder and not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
         local out = {}
         for _, w in ipairs(waypoints) do
             out[#out + 1] = { name = w.name, x = w.pos.X, y = w.pos.Y, z = w.pos.Z }
         end
-        if isfolder and not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
-        writefile(CONFIG_DIR .. "/waypoints.json", Http:JSONEncode(out))
+        writefile(WP_FILE, Http:JSONEncode(out))
     end)
 end
 
@@ -1408,32 +1572,77 @@ end
 --=====================================================================
 local pFarm = newTab("Farm")
 Section(pFarm, "Auto Level Farm")
-Toggle(pFarm, "Auto level farm (quest)", S.AutoFarm, function(v)
-    S.AutoFarm = v
-    if v then S.FarmNearest, S.BossFarm = false, false farmGen = farmGen + 1 runFarm() end
-end)
-local qLabels = { "Auto (by level)" }
-for _, q in ipairs(QUEST[1] and QUESTS[1] or QUESTS[1]) do qLabels[#qLabels + 1] = q.mob .. " (Lv " .. q.lvl .. ")" end
-Dropdown(pFarm, "Quest", qLabels, function(_, i)
+local setFarmT, setNearestT, setBossT
+
+local _, _, _, setQuestOptions = Dropdown(pFarm, "Quest", { "Auto (by level)" }, function(_, i)
     S.QuestIndex = i - 1
     curKey = nil
 end)
-Toggle(pFarm, "Farm Nearest (any mob)", S.FarmNearest, function(v) S.FarmNearest = v end)
+setFarmT = select(2, Toggle(pFarm, "Auto Level Farm (quest)", S.AutoFarm, function(v)
+    S.AutoFarm = v
+    if v then
+        S.FarmNearest = false
+        S.BossFarm = false
+        if setNearestT then setNearestT(false) end
+        if setBossT then setBossT(false) end
+        farmGen = farmGen + 1
+        runFarm()
+    end
+end))
+setNearestT = select(2, Toggle(pFarm, "Farm Nearest (any mob)", S.FarmNearest, function(v)
+    S.FarmNearest = v
+    if v then
+        S.AutoFarm = false
+        S.BossFarm = false
+        if setFarmT then setFarmT(false) end
+        if setBossT then setBossT(false) end
+    end
+end))
+Toggle(pFarm, "Bring Mob (stack under you)", S.BringMob, function(v) S.BringMob = v end)
 Slider(pFarm, "Height Offset", 0, 40, S.HeightOffset, function(v) S.HeightOffset = v end)
 Slider(pFarm, "Hover Range", 50, 500, S.HoverRange, function(v) S.HoverRange = v end)
-Toggle(pFarm, "Bring Mob (stack under you)", S.BringMob, function(v) S.BringMob = v end)
 Toggle(pFarm, "Auto Equip", S.AutoEquip, function(v) S.AutoEquip = v end)
 Dropdown(pFarm, "Equip Type", { "Melee", "Sword", "Gun", "Fruit" }, function(v) S.EquipType = v end)
 Slider(pFarm, "Attack Interval", 0.05, 1, S.AttackInterval, function(v) S.AttackInterval = v end)
 
 Section(pFarm, "Boss")
-local bLabels = {}
-for _, b in ipairs(BOSSES[1]) do bLabels[#bLabels + 1] = b[1] end
-Dropdown(pFarm, "Boss", bLabels, function(_, i) S.BossIndex = i end)
-Toggle(pFarm, "Farm Boss", S.BossFarm, function(v) S.BossFarm = v end)
-Toggle(pFarm, "Auto Saber (Saber Expert)", S.AutoSaber, function(v)
-    S.AutoSaber = v
-    if v then S.BossFarm = true for i, b in ipairs(BOSSES[1]) do if b[1] == "Saber Expert" then S.BossIndex = i end end end
+local _, _, _, setBossOptions = Dropdown(pFarm, "Boss", { "-" }, function(_, i) S.BossIndex = i end)
+setBossT = select(2, Toggle(pFarm, "Farm Boss", S.BossFarm, function(v)
+    S.BossFarm = v
+    if v then
+        S.AutoFarm = false
+        S.FarmNearest = false
+        if setFarmT then setFarmT(false) end
+        if setNearestT then setNearestT(false) end
+    end
+end))
+Toggle(pFarm, "Auto Saber (Saber Expert)", false, function(v)
+    if v then
+        for i, b in ipairs(BOSSES[1]) do
+            if b[1] == "Saber Expert" then S.BossIndex = i end
+        end
+        if setBossT then setBossT(true) end
+    end
+end)
+
+Section(pFarm, "Materials")
+local _, _, _, setMatOptions = Dropdown(pFarm, "Material", { "-" }, function(_, i) S.MaterialIndex = i end)
+Toggle(pFarm, "Material Farm", S.MaterialFarm, function(v)
+    S.MaterialFarm = v
+    if not v then return end
+    local m = (MATERIALS[sea()] or {})[S.MaterialIndex]
+    if not m then notify("No material farm in this sea") return end
+    local found = false
+    for i, q in ipairs(questList()) do
+        if q.mob == m[2] then S.QuestIndex = i found = true break end
+    end
+    if found then
+        curKey = nil
+        if setFarmT then setFarmT(true) end
+        notify("Material farm: " .. m[1])
+    else
+        notify("Source mob not in this sea's quest list")
+    end
 end)
 
 Section(pFarm, "Auto Stats")
@@ -1442,9 +1651,11 @@ Dropdown(pFarm, "Stat", { "Melee", "Defense", "Sword", "Gun", "Blox Fruit", "Dem
 Slider(pFarm, "Points per add", 1, 100, S.StatAmount, function(v) S.StatAmount = v end)
 Toggle(pFarm, "Auto Add Points", S.AutoPoints, function(v) S.AutoPoints = v end)
 
-Section(pFarm, "Chests & Loot")
+Section(pFarm, "Collect  (pauses while farming)")
 Toggle(pFarm, "Auto Chest Farm", S.AutoChest, function(v) S.AutoChest = v end)
-Slider(pFarm, "Teleport Speed", 100, 1000, S.ChestSpeed, function(v) S.ChestSpeed = v end)
+Toggle(pFarm, "Auto Collect Loot", S.AutoLoot, function(v) S.AutoLoot = v end)
+Slider(pFarm, "Loot Range", 100, 2500, S.LootRange, function(v) S.LootRange = v end)
+Slider(pFarm, "Collect Speed", 100, 1000, S.CollectSpeed, function(v) S.CollectSpeed = v end)
 
 local pPvp = newTab("PVP")
 Section(pPvp, "Combat")
@@ -1469,8 +1680,8 @@ Slider(pPvp, "Aim Smoothness", 3, 100, S.AimSmooth, function(v) S.AimSmooth = v 
 Toggle(pPvp, "Follow Nearest", S.Follow, function(v) S.Follow = v end)
 Toggle(pPvp, "1v1 (attack followed)", S.Duel1v1, function(v) S.Duel1v1 = v end)
 Toggle(pPvp, "Spectate Nearest", S.Spectate, function(v) S.Spectate = v end)
-Button(pPvp, "Show captured hitId", function()
-    notify(Net.hitId and ("hitId: " .. tostring(Net.hitId)) or "No hitId yet — land one real M1")
+Button(pPvp, "Show Captured hitId", function()
+    notify(Net.hitId and ("hitId: " .. tostring(Net.hitId)) or "No hitId yet - land one manual M1")
 end)
 Section(pPvp, "Auto Bounty")
 Toggle(pPvp, "Auto Bounty", S.AutoBounty, function(v) S.AutoBounty = v end)
@@ -1483,38 +1694,39 @@ Slider(pPvp, "Retreat below HP %", 0, 100, S.SafeHP, function(v) S.SafeHP = v en
 
 local pTp = newTab("Teleport")
 Section(pTp, "Islands")
-local _, getIsland = Dropdown(pTp, "Island", (function()
-    local l = {}
-    for _, e in ipairs(ISLANDS[1]) do l[#l + 1] = e[1] end
-    return l
-end)(), function(_, i) S.IslandIndex = i end)
+local _, _, _, setIslandOptions = Dropdown(pTp, "Island", { "-" }, function(_, i) S.IslandIndex = i end)
 Button(pTp, "Go to Island", function()
-    local e = ISLANDS[sea()][S.IslandIndex]
-    if e then tpGo(e[2] + Vector3.new(0, 5, 0)) notify("Flying to " .. e[1]) end
+    local list = ISLANDS[sea()] or ISLANDS[1]
+    local e = list[math.clamp(S.IslandIndex, 1, #list)]
+    if e then
+        tpGo(e[2] + Vector3.new(0, 5, 0))
+        notify("Flying to " .. e[1])
+    end
 end)
 Section(pTp, "Bosses")
-local _, getBossTp = Dropdown(pTp, "Boss TP", (function()
-    local l = {}
-    for _, e in ipairs(BOSSES[1]) do l[#l + 1] = e[1] .. " (Lv " .. e[2] .. ")" end
-    return l
-end)(), function(_, i) S.BossTPIndex = i end)
+local _, _, _, setBossTPOptions = Dropdown(pTp, "Boss", { "-" }, function(_, i) S.BossTPIndex = i end)
 Button(pTp, "Go to Boss", function()
-    local e = BOSSES[sea()][S.BossTPIndex]
-    if e then tpGo(e[3] + Vector3.new(0, 5, 0)) notify("Flying to " .. e[1]) end
+    local list = BOSSES[sea()] or BOSSES[1]
+    local e = list[math.clamp(S.BossTPIndex, 1, #list)]
+    if e then
+        tpGo(e[3] + Vector3.new(0, 5, 0))
+        notify("Flying to " .. e[1])
+    end
 end)
 Section(pTp, "Seas")
 Button(pTp, "Sail to Second Sea", function() invoke("TravelDressrosa") notify("Sailing to Sea 2") end)
 Button(pTp, "Sail to Third Sea", function() invoke("TravelZou") notify("Sailing to Sea 3") end)
-Button(pTp, "Set Spawn Here", function() invoke("SetSpawnPoint") notify("Spawn set") end)
+Button(pTp, "Set Spawn Here", function() invoke("SetSpawnPoint") notify("Spawn point set") end)
 Button(pTp, "Notify My Position", function()
-    local h = hrp() if not h then return end
+    local h = hrp()
+    if not h then return end
     local p = h.Position
     local s = ("%.1f, %.1f, %.1f"):format(p.X, p.Y, p.Z)
     notify(s)
     if setclipboard then setclipboard(s) end
 end)
 Section(pTp, "Waypoints")
-local wpName = Textbox(pTp, "Waypoint name...", nil)
+local wpName = Textbox(pTp, "Waypoint name...")
 local wpHolder = make("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, Parent = pTp })
 vlist(wpHolder, 4)
 local function refreshWaypoints()
@@ -1522,9 +1734,9 @@ local function refreshWaypoints()
         if c:IsA("TextButton") then c:Destroy() end
     end
     wpHolder.Size = UDim2.new(1, 0, 0, #waypoints * 29)
-    for i, w in ipairs(waypoints) do
+    for i = 1, #waypoints do
+        local w = waypoints[i]
         local b = Button(wpHolder, "Go: " .. w.name, function() tpGo(w.pos) end)
-        b.MouseButton2Click = b.MouseButton2Click
         b.MouseButton2Click:Connect(function()
             table.remove(waypoints, i)
             saveWaypoints()
@@ -1548,12 +1760,11 @@ Button(pTp, "Clear All Waypoints", function()
     saveWaypoints()
     refreshWaypoints()
 end)
-refreshWaypoints()
 Section(pTp, "Server")
-Button(pTp, "Rejoin Server", function() TeleportSvc:Teleport(PLACE_ID, LP) end)
+Button(pTp, "Rejoin Server", function() TeleportSvc:Teleport(game.PlaceId, LP) end)
 Button(pTp, "Server Hop", function()
     local ok, body = pcall(function()
-        return game:HttpGet("https://games.roblox.com/v1/games/" .. PLACE_ID .. "/servers/Public?limit=100")
+        return game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?limit=100")
     end)
     if not ok then notify("Hop failed") return end
     local data
@@ -1566,9 +1777,11 @@ Button(pTp, "Server Hop", function()
     if #pool == 0 then notify("No open servers") return end
     notify("Hopping...")
     task.wait(0.3)
-    TeleportSvc:TeleportToPlaceInstance(PLACE_ID, pool[math.random(#pool)], LP)
+    TeleportSvc:TeleportToPlaceInstance(game.PlaceId, pool[math.random(#pool)], LP)
 end)
-Button(pTp, "Copy Job ID", function() if setclipboard then setclipboard(game.JobId) notify("Copied") end end)
+Button(pTp, "Copy Job ID", function()
+    if setclipboard then setclipboard(game.JobId) notify("Job ID copied") end
+end)
 
 local pPlayer = newTab("Player")
 Section(pPlayer, "Stats")
@@ -1577,27 +1790,33 @@ Slider(pPlayer, "Jump Power", 50, 600, S.Jump, function(v) S.Jump = v applyStats
 Toggle(pPlayer, "Infinite Energy", S.InfEnergy, function(v) S.InfEnergy = v end)
 Section(pPlayer, "Movement")
 Toggle(pPlayer, "Noclip", S.Noclip, function(v) S.Noclip = v end)
-Toggle(pPlayer, "Fly (WASD / Space / LShift)", S.Fly, function(v) S.Fly = v if not v then stopFly() end end)
-Slider(pPlayer, "Fly / TP Speed", 50, 1000, S.FlySpeed, function(v) S.FlySpeed = v end)
+Toggle(pPlayer, "Fly (WASD / Space / LShift)", S.Fly, function(v)
+    S.Fly = v
+    if not v then stopFly() end
+end)
+Slider(pPlayer, "Fly / Teleport Speed", 50, 1000, S.FlySpeed, function(v) S.FlySpeed = v end)
 Section(pPlayer, "Haki")
 Toggle(pPlayer, "Auto Buso Haki", S.AutoBuso, function(v) S.AutoBuso = v end)
 Toggle(pPlayer, "Auto Ken Haki", S.AutoKen, function(v) S.AutoKen = v end)
 Section(pPlayer, "Misc")
 Toggle(pPlayer, "Anti-AFK", S.AntiAFK, function(v) S.AntiAFK = v end)
-Button(pPlayer, "Reset Character", function() local h = hum() if h then h.Health = 0 end end)
+Button(pPlayer, "Reset Character", function()
+    local h = hum()
+    if h then h.Health = 0 end
+end)
 
 local pFruit = newTab("Fruits")
 Section(pFruit, "Devil Fruits")
-Toggle(pFruit, "Fruit ESP", S.ESPFruits, function(v) S.ESPFruits = v end)
+Toggle(pFruit, "Fruit ESP", S.ESPFruits, function(v) S.ESPFruits = v end, "fruitesp")
 Toggle(pFruit, "Auto Collect Fruit", S.AutoFruit, function(v) S.AutoFruit = v end)
 Button(pFruit, "Teleport to Nearest Fruit", function()
     local f = getGroundFruits()
     if #f == 0 then notify("No fruit on the ground") return end
     table.sort(f, function(a, b) return a.d < b.d end)
-    tpGo(f[1].part.Position + Vector3.new(0, 3, 0), S.ChestSpeed)
+    tpGo(f[1].part.Position + Vector3.new(0, 3, 0), S.CollectSpeed)
     notify("Flying to " .. f[1].name)
 end)
-Section(pFruit, "Shop")
+Section(pFruit, "Shop  (stand near the NPC)")
 local shop = {
     { "Buy Busoshoku Haki", "BuyHaki", "Buso" },
     { "Buy Kenbunshoku Haki", "BuyHaki", "Ken" },
@@ -1612,7 +1831,8 @@ local shop = {
     { "Buy Electric Claw", "BuyElectricClaw" },
     { "Buy Dragon Talon", "BuyDragonTalon" },
 }
-for _, s in ipairs(shop) do
+for i = 1, #shop do
+    local s = shop[i]
     Button(pFruit, s[1], function()
         if s[3] then invoke(s[2], s[3]) else invoke(s[2]) end
         notify(s[1])
@@ -1628,8 +1848,8 @@ local pVis = newTab("Visuals")
 Section(pVis, "ESP")
 Toggle(pVis, "Mobs", S.ESPMobs, function(v) S.ESPMobs = v end)
 Toggle(pVis, "Players", S.ESPPlayers, function(v) S.ESPPlayers = v end)
-Toggle(pVis, "Chests", S.ESPChests, function(v) S.ESPChests = v end)
-Toggle(pVis, "Fruits", S.ESPFruits, function(v) S.ESPFruits = v end)
+Toggle(pVis, "Chests / Barrels", S.ESPChests, function(v) S.ESPChests = v end)
+Toggle(pVis, "Fruits", S.ESPFruits, function(v) S.ESPFruits = v end, "fruitesp")
 Section(pVis, "World")
 Toggle(pVis, "Fullbright", S.Fullbright, function(v)
     S.Fullbright = v
@@ -1641,16 +1861,19 @@ end)
 
 local pMisc = newTab("Misc")
 Section(pMisc, "Debug")
-Button(pMisc, "Run Diagnostics", function()
+Button(pMisc, "Run Diagnostics (prints + copies)", function()
     local RA, RH = netModules()
     local l = {
-        "Sea: " .. sea(), "Level: " .. level(), "Ping: " .. ping() .. "ms",
+        "Sea: " .. sea(),
+        "Level: " .. level(),
+        "Ping: " .. ping() .. "ms",
         "Enemies folder: " .. tostring(enemies()),
         "Enemy count: " .. tostring(enemies() and #enemies():GetChildren()),
         "_WorldOrigin.Locations: " .. tostring(locations()),
         "Remotes: " .. tostring(RS:FindFirstChild("Remotes")),
         "CommF_: " .. tostring(CommF_),
-        "RegisterAttack: " .. tostring(RA), "RegisterHit: " .. tostring(RH),
+        "RegisterAttack: " .. tostring(RA),
+        "RegisterHit: " .. tostring(RH),
         "hitId: " .. tostring(Net.hitId),
         "hookmetamethod: " .. tostring(hookmetamethod ~= nil),
         "firetouchinterest: " .. tostring(firetouchinterest ~= nil),
@@ -1660,28 +1883,78 @@ Button(pMisc, "Run Diagnostics", function()
     print("[VeniceHub DIAG]\n" .. s)
     if setclipboard then setclipboard(s) notify("Diagnostics copied") end
 end)
-Button(pMisc, "Test Attack Remote", function()
+Button(pMisc, "Test Attack (nearest mob)", function()
     local t = nearestAnyMob(500)
-    if not t then notify("No mob nearby") return end
+    if not t then notify("No mob within 500 studs") return end
     attackOnce(t)
-    notify("Fired at " .. t.Name .. " (hitId: " .. tostring(Net.hitId) .. ")")
+    notify("Fired at " .. t.Name .. "  (hitId: " .. tostring(Net.hitId) .. ")")
 end)
-Button(pMisc, "Force hitId re-capture", function()
+Button(pMisc, "Force hitId Re-capture", function()
     Net.hooked = false
-    installHitCapture()
-    notify("Capture reinstalled")
+    Net.fallbackTried = false
+    if installHitCapture() then notify("Capture reinstalled") else notify("Modules.Net not ready") end
 end)
 Section(pMisc, "Config")
-Button(pMisc, "Save Settings", function() saveConfig() notify("Saved") end)
-Button(pMisc, "Load Settings", function() loadConfig() notify("Loaded") end)
+Button(pMisc, "Save Settings", function() saveConfig() notify("Settings saved") end)
+Button(pMisc, "Load Settings", function() loadConfig() notify("Settings loaded") end)
 Section(pMisc, "Info")
 Button(pMisc, "Toggle UI (RightControl)", function() Main.Visible = not Main.Visible end)
 Button(pMisc, "Unload Hub (RightShift)", function()
     for k, v in pairs(S) do if type(v) == "boolean" then S[k] = false end end
-    stopFly() tpCancel()
+    stopFly()
+    tpCancel()
     pcall(function() Gui:Destroy() end)
     if getgenv then getgenv().VeniceHub = nil end
     notify("Unloaded")
+end)
+
+--=====================================================================
+--  SEA WATCHER  ·  rebuild dropdowns when the place changes
+--=====================================================================
+local function rebuildForSea(s)
+    local ql = { "Auto (by level)" }
+    for _, q in ipairs(QUESTS[s] or QUESTS[1]) do
+        ql[#ql + 1] = q.mob .. " (Lv " .. q.lvl .. ")"
+    end
+    setQuestOptions(ql)
+    S.QuestIndex = 0
+    curKey = nil
+
+    local il = {}
+    for _, e in ipairs(ISLANDS[s] or ISLANDS[1]) do il[#il + 1] = e[1] end
+    setIslandOptions(il)
+    S.IslandIndex = 1
+
+    local bl = {}
+    for _, e in ipairs(BOSSES[s] or BOSSES[1]) do bl[#bl + 1] = e[1] .. " (Lv " .. e[2] .. ")" end
+    setBossOptions(bl)
+    setBossTPOptions(bl)
+    S.BossIndex = 1
+    S.BossTPIndex = 1
+
+    local ml = {}
+    for _, e in ipairs(MATERIALS[s] or {}) do ml[#ml + 1] = e[1] .. "  (" .. e[2] .. ")" end
+    if #ml == 0 then ml = { "none in this sea" } end
+    setMatOptions(ml)
+    S.MaterialIndex = 1
+
+    log("rebuilt lists for Sea " .. s)
+end
+
+rebuildForSea(sea())
+refreshWaypoints()
+
+task.spawn(function()
+    local last = sea()
+    while Gui.Parent do
+        task.wait(2)
+        local s = sea()
+        if s ~= last then
+            last = s
+            rebuildForSea(s)
+            notify("Sea change detected - lists rebuilt for Sea " .. s)
+        end
+    end
 end)
 
 if tabs[1] then
@@ -1702,7 +1975,8 @@ end)
 UIS.InputChanged:Connect(function(i)
     if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
         local d = i.Position - dragStart
-        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
 end)
 UIS.InputEnded:Connect(function(i)
@@ -1716,7 +1990,8 @@ UIS.InputBegan:Connect(function(i, gp)
         Main.Visible = not Main.Visible
     elseif i.KeyCode == Enum.KeyCode.RightShift then
         for k, v in pairs(S) do if type(v) == "boolean" then S[k] = false end end
-        stopFly() tpCancel()
+        stopFly()
+        tpCancel()
         pcall(function() Gui:Destroy() end)
         if getgenv then getgenv().VeniceHub = nil end
     end
@@ -1724,23 +1999,24 @@ end)
 
 task.spawn(function()
     while Gui.Parent do
-        task.wait(0.6)
+        task.wait(0.8)
         local bits = {}
-        for _, k in ipairs({ "AutoFarm", "FarmNearest", "BossFarm", "KillAura", "AutoChest",
-                            "AutoFruit", "AutoBounty", "Fly", "AutoSkills", "FastAttack" }) do
-            if S[k] then bits[#bits + 1] = k end
+        local watch = { "AutoFarm", "FarmNearest", "BossFarm", "KillAura", "AutoChest",
+                        "AutoLoot", "AutoFruit", "AutoBounty", "Fly", "AutoSkills", "FastAttack" }
+        for i = 1, #watch do
+            if S[watch[i]] then bits[#bits + 1] = watch[i] end
         end
         local q = currentQuest()
+        local okCount, cnt = pcall(function() return enemies() and #enemies():GetChildren() or 0 end)
         Status.Text = (#bits > 0 and table.concat(bits, " · ") or "idle")
-            .. "   |  Lv " .. level()
+            .. "  |  Sea " .. sea() .. "  Lv " .. level()
             .. "  |  quest: " .. (q and q.mob or "-")
-            .. "  |  mobs: " .. tostring(enemies() and #enemies():GetChildren() or 0)
-            .. "  |  fruit: " .. tostring(#getGroundFruits())
+            .. "  |  mobs: " .. tostring(okCount and cnt or 0)
             .. "  |  hitId: " .. tostring(Net.hitId and "ok" or "none")
     end
 end)
 
-installHitCapture()
 if getgenv then getgenv().VeniceHub = { Gui = Gui, Config = S } end
+installHitCapture()
 applyStats()
-notify("Venice Hub v3 loaded  ·  RightControl to toggle", "Blox Fruits")
+notify("Venice Hub v4 loaded  ·  RightControl to toggle", "Blox Fruits")
